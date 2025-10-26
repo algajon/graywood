@@ -4,8 +4,6 @@ namespace App\Http\Controllers;
 
 use Illuminate\Http\Request;
 use Illuminate\Support\Facades\Auth;
-use Illuminate\Support\Facades\Hash;
-use Illuminate\Support\Facades\Validator;
 use App\Models\User;
 use Illuminate\Auth\Events\Registered;
 
@@ -28,22 +26,19 @@ class LoginController extends Controller
     public function login(Request $request)
     {
         $credentials = $request->validate([
-            'email' => 'required|email',
+            'email'    => 'required|email',
             'password' => 'required',
         ]);
 
         if (Auth::attempt($credentials, $request->boolean('remember'))) {
             $request->session()->regenerate();
 
-            // Redirect based on user tier
+            // Redirect by tier; guest/user/paid go to dashboard, admin to admin dashboard.
             $user = Auth::user();
             if ($user->tier === 'admin') {
                 return redirect()->intended('/admin/dashboard');
-            } elseif ($user->tier === 'paid') {
-                return redirect()->intended('/dashboard');
-            } else {
-                return redirect()->intended('/dashboard');
             }
+            return redirect()->intended('/dashboard');
         }
 
         return back()->withErrors([
@@ -64,42 +59,41 @@ class LoginController extends Controller
 
     /**
      * Handle registration request
+     *
+     * NOTE:
+     * - New users ALWAYS start with tier = 'guest'
+     * - The plan selection is ONLY used to set redirect_to on the frontend (not tier here)
      */
     public function register(Request $request)
     {
-        $validator = Validator::make($request->all(), [
-            'name' => 'required|string|max:255',
-            'email' => 'required|string|email|max:255|unique:users',
-            'password' => 'required|string|min:8|confirmed',
-            'company' => 'nullable|string|max:255',
-            'phone' => 'nullable|string|max:20',
-            'subscription_tier' => 'required|in:user,paid,admin',
+        $validated = $request->validate([
+            'name'                  => 'required|string|max:255',
+            'email'                 => 'required|string|email|max:255|unique:users',
+            'password'              => 'required|string|min:8|confirmed',
+            'company'               => 'nullable|string|max:255',
+            'phone'                 => 'nullable|string|max:32',
+            // no subscription_tier/plan_choice here on purpose
+            'redirect_to'           => 'nullable|string', // set by the form to /dashboard or /book
         ]);
 
-        if ($validator->fails()) {
-            return back()->withErrors($validator)->withInput();
-        }
-
+        // Create user. If your User model has ['password' => 'hashed'] cast,
+        // this will be hashed automatically.
         $user = User::create([
-            'name' => $request->name,
-            'email' => $request->email,
-            'password' => Hash::make($request->password),
-            'company' => $request->company,
-            'phone' => $request->phone,
-            'tier' => $request->subscription_tier,
-            'email_verified_at' => now(), // Auto-verify for demo
+            'name'              => $validated['name'],
+            'email'             => $validated['email'],
+            'password'          => $validated['password'],
+            'company'           => $validated['company'] ?? null,
+            'phone'             => $validated['phone'] ?? null,
+            'tier'              => 'user',               // <- everyone starts as guest
+            'email_verified_at' => now(),
         ]);
 
         event(new Registered($user));
-
         Auth::login($user);
 
-        // Redirect based on user tier
-        if ($user->tier === 'admin') {
-            return redirect('/admin/dashboard');
-        } else {
-            return redirect('/dashboard');
-        }
+        // Respect redirect_to posted by the form; default to /dashboard
+        $to = $request->input('redirect_to', '/dashboard');
+        return redirect()->intended($to);
     }
 
     /**
@@ -121,11 +115,11 @@ class LoginController extends Controller
     public function dashboard()
     {
         $user = Auth::user();
-        
+
         if ($user->tier === 'admin') {
             return redirect('/admin/dashboard');
         }
-        
+
         return view('dashboard', compact('user'));
     }
 
@@ -135,13 +129,13 @@ class LoginController extends Controller
     public function adminDashboard()
     {
         $user = Auth::user();
-        
+
         if ($user->tier !== 'admin') {
             abort(403, 'Unauthorized access.');
         }
-        
+
         $users = User::where('tier', '!=', 'admin')->get();
-        
+
         return view('admin.dashboard', compact('user', 'users'));
     }
 }

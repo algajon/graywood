@@ -95,18 +95,22 @@
                     if (!hasScrolled) {
                         link.classList.add('hover:text-gray-300');
                     } else {
-                        link.classList.add('hover:text-blue-500');
+                        // use green-950 hex on hover in light mode
+                        link.classList.add('hover:text-[#052e16]');
                     }
                 });
                 link.addEventListener('mouseleave', () => {
                     if (!hasScrolled) {
                         link.classList.remove('hover:text-gray-300');
                     } else {
-                        link.classList.remove('hover:text-blue-500');
+                        link.classList.remove('hover:text-[#052e16]');
                     }
                 });
             });
-            mobileMenuBtn.classList.add('text-white');
+            if (mobileMenuBtn) {
+                mobileMenuBtn.classList.add('text-white');
+                mobileMenuBtn.addEventListener('click', toggleMobileMenu);
+            }
         }
 
         // Handle scroll functionality with smooth animation
@@ -213,16 +217,31 @@
 
         function toggleMobileMenu() {
             const mobileMenu = document.getElementById('mobile-menu');
-            mobileMenu.classList.toggle('hidden');
+            const isOpen = mobileMenu.classList.contains('open');
+            if (isOpen) {
+                // animate closed then hide
+                mobileMenu.classList.remove('open');
+                setTimeout(() => mobileMenu.classList.add('hidden'), 300);
+            } else {
+                // show then animate open
+                mobileMenu.classList.remove('hidden');
+                setTimeout(() => mobileMenu.classList.add('open'), 20);
+            }
         }
-        
+
         // Close mobile menu when clicking outside
         document.addEventListener('click', function(event) {
             const mobileMenu = document.getElementById('mobile-menu');
-            const menuButton = event.target.closest('button');
-            
-            if (!mobileMenu.contains(event.target) && !menuButton) {
-                mobileMenu.classList.add('hidden');
+            if (!mobileMenu.classList.contains('open')) return; // nothing to do
+
+            const panel = mobileMenu.querySelector('.mobile-panel');
+            const clickedInsidePanel = panel && panel.contains(event.target);
+            const clickedMenuButton = event.target.closest('#mobile-menu-btn') || event.target.closest('.mobile-panel button');
+
+            if (!clickedInsidePanel && !clickedMenuButton) {
+                // close
+                mobileMenu.classList.remove('open');
+                setTimeout(() => mobileMenu.classList.add('hidden'), 300);
             }
         });
 

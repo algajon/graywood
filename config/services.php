@@ -18,6 +18,10 @@ return [
         'token' => env('POSTMARK_TOKEN'),
     ],
 
+    'ghl' => [
+    'calendar_url' => env('GHL_CALENDAR_URL'), // paste the iframe src here
+    ],
+
     'resend' => [
         'key' => env('RESEND_KEY'),
     ],
