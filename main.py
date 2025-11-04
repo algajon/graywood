@@ -67,10 +67,10 @@ def human_settle(browser, settle_seconds=0.8):
     except Exception:
         pass
     time.sleep(settle_seconds)
-
 def new_browser() -> Browser:
-    # ✅ Automatically installs the correct ChromeDriver version
-    chromedriver_autoinstaller.install()
+    import tempfile, os, chromedriver_autoinstaller
+    chromedriver_path = chromedriver_autoinstaller.install(path=tempfile.gettempdir())
+    os.chmod(chromedriver_path, 0o755)
 
     opts = Options()
     opts.add_argument("--headless=new")
@@ -79,8 +79,9 @@ def new_browser() -> Browser:
     opts.add_argument("--disable-gpu")
     opts.add_argument("--window-size=1920,1080")
     opts.binary_location = "/usr/bin/google-chrome"
-    return Browser("chrome", options=opts)
 
+    # ✅ Tell Splinter/Selenium exactly where the driver lives
+    return Browser("chrome", options=opts, executable_path=chromedriver_path)
 def visit_with_retry(browser: Browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
     for i in range(tries):
