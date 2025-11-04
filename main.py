@@ -70,15 +70,13 @@ def human_settle(browser, settle_seconds=0.8):
 def new_browser() -> Browser:
     opts = Options()
     opts.add_argument("--headless=new")
-    opts.add_argument("--window-size=1920,1080")
     opts.add_argument("--no-sandbox")
     opts.add_argument("--disable-dev-shm-usage")
     opts.add_argument("--disable-gpu")
-    opts.add_argument("--lang=en-US")
-    opts.add_argument("--disable-blink-features=AutomationControlled")
-    opts.add_argument("--user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-    return Browser('chrome', options=opts)
-
+    opts.add_argument("--window-size=1920,1080")
+    opts.binary_location = "/usr/bin/google-chrome"
+    return Browser("chrome", options=opts)
+    
 def visit_with_retry(browser: Browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
     for i in range(tries):
