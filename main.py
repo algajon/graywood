@@ -8,15 +8,23 @@ from fastapi.responses import RedirectResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
-from splinter import Browser
 from bs4 import BeautifulSoup
+
+from selenium import webdriver
 from selenium.webdriver.chrome.options import Options
-import chromedriver_autoinstaller  # ✅ Added to auto-install matching ChromeDriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+
+import chromedriver_autoinstaller
+import os
+import tempfile
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.2.1")
+app = FastAPI(title="Kijiji Scraper API", version="0.3.0")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -54,7 +62,9 @@ def log(run_id: str, msg: str):
 
 def wait_for_dom(browser, css_selector="body", timeout=10):
     try:
-        browser.is_element_present_by_css(css_selector, wait_time=timeout)
+        WebDriverWait(browser, timeout).until(
+            EC.presence_of_element_located((By.CSS_SELECTOR, css_selector))
+        )
     except Exception:
         pass
 
@@ -67,32 +77,42 @@ def human_settle(browser, settle_seconds=0.8):
     except Exception:
         pass
     time.sleep(settle_seconds)
-def new_browser() -> Browser:
-    import tempfile, os, chromedriver_autoinstaller
-    from selenium.webdriver.chrome.service import Service
 
-    # ✅ Install ChromeDriver into a writable tmp dir
-    chromedriver_path = chromedriver_autoinstaller.install(path=tempfile.gettempdir())
-    os.chmod(chromedriver_path, 0o755)
+def new_browser():
+    # Install ChromeDriver into a writable temp directory
+    driver_path = chromedriver_autoinstaller.install(path=tempfile.gettempdir())
+    os.chmod(driver_path, 0o755)
 
-    opts = Options()
-    opts.add_argument("--headless=new")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    opts.add_argument("--disable-gpu")
-    opts.add_argument("--window-size=1920,1080")
-    opts.binary_location = "/usr/bin/google-chrome"
+    options = Options()
+    # Container-safe flags
+    options.add_argument("--headless")  # more compatible than --headless=new
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--disable-software-rasterizer")
+    options.add_argument("--window-size=1920,1080")
 
-    # ✅ Explicitly create a Chrome Service using the driver path
-    service = Service(executable_path=chromedriver_path)
+    # Try common Chrome/Chromium locations
+    possible_binaries = [
+        "/usr/bin/google-chrome",
+        "/usr/bin/google-chrome-stable",
+        "/usr/bin/chromium-browser",
+        "/usr/bin/chromium",
+    ]
+    for path in possible_binaries:
+        if os.path.exists(path):
+            options.binary_location = path
+            break
 
-    # ✅ Pass service + options directly to Splinter
-    return Browser("chrome", options=opts, service=service)
-def visit_with_retry(browser: Browser, url: str, tries: int = 3, wait_css="body"):
+    service = Service(executable_path=driver_path)
+    driver = webdriver.Chrome(service=service, options=options)
+    return driver
+
+def visit_with_retry(browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
     for i in range(tries):
         try:
-            browser.visit(url)
+            browser.get(url)
             wait_for_dom(browser, wait_css, timeout=8)
             human_settle(browser)
             return True
@@ -121,13 +141,13 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     soup = BeautifulSoup(page_html, 'html.parser')
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
-        href = link["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = link["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
-        href = a["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
-        href = a2["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a2["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
@@ -236,13 +256,15 @@ def run_scrape(run_id: str, params: ScrapeParams):
         while scraped_count < params.max_listings:
             log(run_id, f"Visiting search page {page}: {current_url}")
             visit_with_retry(browser, current_url, wait_css="body")
-            listing_links = get_listing_links_from_html(browser.html)
+            listing_links = get_listing_links_from_html(browser.page_source)
             if not listing_links:
                 log(run_id, "No listing anchors found on this page.")
 
             for href in listing_links:
-                if scraped_count >= params.max_listings: break
-                if href in scraped_urls: continue
+                if scraped_count >= params.max_listings:
+                    break
+                if href in scraped_urls:
+                    continue
                 scraped_urls.add(href)
 
                 try:
@@ -251,32 +273,39 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — failed to open ({e})")
                     continue
 
+                # Skip management/agency profile-logo listings
                 try:
-                    if browser.is_element_present_by_css("div.sc-30b4d0e2-4.gWNMuB img[data-testid='profile-logo']", wait_time=0.5):
-                        log(run_id, f"Skipped {href} — profile logo image.")
-                        continue
+                    WebDriverWait(browser, 0.5).until(
+                        EC.presence_of_element_located(
+                            (By.CSS_SELECTOR, "div.sc-30b4d0e2-4.gWNMuB img[data-testid='profile-logo']")
+                        )
+                    )
+                    log(run_id, f"Skipped {href} — profile logo image.")
+                    continue
                 except Exception:
                     pass
 
-                soup = BeautifulSoup(browser.html, 'html.parser')
+                soup = BeautifulSoup(browser.page_source, 'html.parser')
                 description = extract_description_text(soup)
                 if realtor_filter.search(description):
                     log(run_id, f"Skipped {href} — realtor keywords.")
                     continue
 
+                # Reveal phone
                 try:
-                    btn = browser.find_by_xpath("//p[@aria-label='Reveal phone number']")
-                    if btn:
-                        try: btn.first.click()
-                        except Exception: btn.click()
+                    btns = browser.find_elements(By.XPATH, "//p[@aria-label='Reveal phone number']")
+                    if btns:
+                        try:
+                            btns[0].click()
+                        except Exception:
+                            browser.execute_script("arguments[0].click();", btns[0])
                         log(run_id, "Clicked Reveal button.")
                         time.sleep(1.2)
                 except Exception as e:
                     log(run_id, f"Reveal button not found or failed: {e}")
 
-                soup_after = BeautifulSoup(browser.html, 'html.parser')
+                soup_after = BeautifulSoup(browser.page_source, 'html.parser')
                 phone_number = find_phone_from_reveal(soup_after)
-
                 if not phone_number:
                     phone_number = find_phone_in_description(description)
 
@@ -285,19 +314,24 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     continue
 
                 prospect_name, profile_url = extract_seller_info(soup_after)
+
                 asking_price = ""
                 ptag = soup_after.select_one("p[data-testid='vip-price']")
-                if ptag: asking_price = ptag.get_text(strip=True)
+                if ptag:
+                    asking_price = ptag.get_text(strip=True)
 
-                unit_address = ""; city = ""
+                unit_address = ""
+                city = ""
                 addr_btn = soup_after.select_one("div.sc-eb45309b-0.bEMmoW button.sc-c8742e84-0.fukShK")
                 if addr_btn:
                     full = addr_btn.get_text(strip=True)
                     unit_address = full
                     parts = [p.strip() for p in full.split(',')]
-                    if len(parts) >= 2: city = parts[-2]
+                    if len(parts) >= 2:
+                        city = parts[-2]
 
                 available_date = extract_available_date_from_details(soup_after)
+
                 emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description or "")
                 email = emails[0] if emails else ""
 
@@ -324,24 +358,36 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 log(run_id, f"Saved {scraped_count}/{params.max_listings}")
 
             if scraped_count >= params.max_listings:
-                log(run_id, "Reached max_listings."); break
+                log(run_id, "Reached max_listings.")
+                break
 
             try:
                 visit_with_retry(browser, current_url, wait_css="body")
             except Exception:
                 pass
-            next_url = find_next_page_url(current_url, browser.html)
-            if not next_url: log(run_id, "No next page detected. Done."); break
-            if next_url == current_url: log(run_id, "Next URL equals current URL (loop guard). Done."); break
-            current_url = next_url; page += 1
+            next_url = find_next_page_url(current_url, browser.page_source)
+            if not next_url:
+                log(run_id, "No next page detected. Done.")
+                break
+            if next_url == current_url:
+                log(run_id, "Next URL equals current URL (loop guard). Done.")
+                break
+            current_url = next_url
+            page += 1
 
-        try: browser.quit()
-        except Exception: pass
+        try:
+            browser.quit()
+        except Exception:
+            pass
 
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
 
     except Exception as e:
+        try:
+            browser.quit()
+        except Exception:
+            pass
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
         RUNS[run_id]["logs"].append(f"ERROR: {e}")
@@ -352,7 +398,7 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     run_id = str(uuid.uuid4())
     RUNS[run_id] = {
         "status": "queued",
-        "params": payload.dict(),  # ✅ Fixed: works on both Pydantic v1 and v2
+        "params": payload.dict(),  # pydantic v1/v2 compatible
         "results": [],
         "logs": [],
         "count": 0,
@@ -362,7 +408,6 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     bg.add_task(run_scrape, run_id, payload)
     return StartResponse(run_id=run_id, status="queued")
 
-# Helpful root + alias endpoints for compatibility with agentbookr.com and render
 @app.get("/", include_in_schema=False)
 def root_redirect():
     return RedirectResponse(url="/docs")
@@ -378,7 +423,8 @@ def scrapes_start(payload: ScrapeParams, bg: BackgroundTasks):
 @app.get("/runs/{run_id}", response_model=RunStatus)
 def get_status(run_id: str):
     run = RUNS.get(run_id)
-    if not run: raise HTTPException(404, "run not found")
+    if not run:
+        raise HTTPException(404, "run not found")
     return RunStatus(
         run_id=run_id,
         status=run["status"],
@@ -391,13 +437,20 @@ def get_status(run_id: str):
 @app.get("/runs/{run_id}/results")
 def get_results(run_id: str):
     run = RUNS.get(run_id)
-    if not run: raise HTTPException(404, "run not found")
-    return {"run_id": run_id, "status": run["status"], "count": run["count"], "results": run["results"]}
+    if not run:
+        raise HTTPException(404, "run not found")
+    return {
+        "run_id": run_id,
+        "status": run["status"],
+        "count": run["count"],
+        "results": run["results"],
+    }
 
 @app.get("/runs/{run_id}/export.csv")
 def export_csv(run_id: str):
     run = RUNS.get(run_id)
-    if not run: raise HTTPException(404, "run not found")
+    if not run:
+        raise HTTPException(404, "run not found")
     import io
     if not run["results"]:
         return {"message": "no results"}
@@ -412,5 +465,5 @@ def export_csv(run_id: str):
     return StreamingResponse(
         buf,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{run_id}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{run_id}.csv\"'},
     )
