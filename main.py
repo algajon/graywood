@@ -4,6 +4,8 @@ from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
 from fastapi import FastAPI, BackgroundTasks, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from splinter import Browser
@@ -14,6 +16,19 @@ from selenium.webdriver.chrome.options import Options
 RUNS: Dict[str, dict] = {}
 
 app = FastAPI(title="Kijiji Scraper API", version="0.2.0")
+
+# Allow requests from the main public site so agentbookr.com can call this service directly.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "https://agentbookr.com",
+        "https://www.agentbookr.com",
+        "http://localhost:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # ---------------- Models ----------------
 class ScrapeParams(BaseModel):
@@ -352,6 +367,24 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     }
     bg.add_task(run_scrape, run_id, payload)
     return StartResponse(run_id=run_id, status="queued")
+
+
+# Helpful root + alias endpoints for compatibility with agentbookr.com and render
+@app.get("/", include_in_schema=False)
+def root_redirect():
+    # Redirect visitors to the interactive docs for quick testing
+    return RedirectResponse(url="/docs")
+
+
+@app.get("/health", include_in_schema=False)
+def health():
+    return JSONResponse({"status": "ok"})
+
+
+@app.post("/scrapes.start", response_model=StartResponse)
+def scrapes_start(payload: ScrapeParams, bg: BackgroundTasks):
+    """Alias for older clients that post to /scrapes.start (keeps compatibility)."""
+    return start_scrape(payload, bg)
 
 @app.get("/runs/{run_id}", response_model=RunStatus)
 def get_status(run_id: str):
