@@ -200,15 +200,10 @@ def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
 AVAILABLE_P_RE = re.compile(r"^\s*Available\b", re.I)
 
 def extract_available_date_from_details(soup: BeautifulSoup) -> str:
-    """
-    Find a <p> whose text starts with 'Available ...' anywhere in the details block.
-    Returns just the date-ish part (text after 'Available '), e.g. 'November 1, 2025'.
-    """
     p = soup.find('p', string=AVAILABLE_P_RE)
     if not p:
         return ""
     txt = p.get_text(strip=True)
-    # Strip the 'Available' prefix
     m = re.search(r"Available\s*(.*)$", txt, re.I)
     return (m.group(1).strip() if m else txt)
 
@@ -245,7 +240,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — failed to open ({e})")
                     continue
 
-                # Skip profile-logo listings (typical management/agency)
                 try:
                     if browser.is_element_present_by_css("div.sc-30b4d0e2-4.gWNMuB img[data-testid='profile-logo']", wait_time=0.5):
                         log(run_id, f"Skipped {href} — profile logo image.")
@@ -254,14 +248,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     pass
 
                 soup = BeautifulSoup(browser.html, 'html.parser')
-
-                # ---- Description (ONLY place for text phone fallback) ----
                 description = extract_description_text(soup)
                 if realtor_filter.search(description):
                     log(run_id, f"Skipped {href} — realtor keywords.")
                     continue
 
-                # ---- PHONE (required): try Reveal first, else description +1 ----
                 try:
                     btn = browser.find_by_xpath("//p[@aria-label='Reveal phone number']")
                     if btn:
@@ -282,10 +273,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — no valid phone (reveal or +1 in description).")
                     continue
 
-                # ---- Prospect / profile ----
                 prospect_name, profile_url = extract_seller_info(soup_after)
-
-                # ---- Optional metadata (NO Ad ID captured) ----
                 asking_price = ""
                 ptag = soup_after.select_one("p[data-testid='vip-price']")
                 if ptag: asking_price = ptag.get_text(strip=True)
@@ -298,10 +286,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     parts = [p.strip() for p in full.split(',')]
                     if len(parts) >= 2: city = parts[-2]
 
-                # NEW: Available Date from details 'Available …' paragraph
                 available_date = extract_available_date_from_details(soup_after)
-
-                # Email (description only)
                 emails = re.findall(r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+", description or "")
                 email = emails[0] if emails else ""
 
@@ -356,7 +341,7 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     run_id = str(uuid.uuid4())
     RUNS[run_id] = {
         "status": "queued",
-        "params": payload.model_dump(),
+        "params": payload.dict(),  # ✅ Fixed: works on both Pydantic v1 and v2
         "results": [],
         "logs": [],
         "count": 0,
@@ -366,22 +351,17 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     bg.add_task(run_scrape, run_id, payload)
     return StartResponse(run_id=run_id, status="queued")
 
-
 # Helpful root + alias endpoints for compatibility with agentbookr.com and render
 @app.get("/", include_in_schema=False)
 def root_redirect():
-    # Redirect visitors to the interactive docs for quick testing
     return RedirectResponse(url="/docs")
-
 
 @app.get("/health", include_in_schema=False)
 def health():
     return JSONResponse({"status": "ok"})
 
-
 @app.post("/scrapes.start", response_model=StartResponse)
 def scrapes_start(payload: ScrapeParams, bg: BackgroundTasks):
-    """Alias for older clients that post to /scrapes.start (keeps compatibility)."""
     return start_scrape(payload, bg)
 
 @app.get("/runs/{run_id}", response_model=RunStatus)
