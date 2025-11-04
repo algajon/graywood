@@ -69,13 +69,11 @@ def human_settle(browser, settle_seconds=0.8):
     time.sleep(settle_seconds)
 def new_browser() -> Browser:
     import tempfile, os, chromedriver_autoinstaller
+    from selenium.webdriver.chrome.service import Service
 
-    # ✅ Install ChromeDriver into a user-writable directory (Render-safe)
+    # ✅ Install ChromeDriver into a writable tmp dir
     chromedriver_path = chromedriver_autoinstaller.install(path=tempfile.gettempdir())
     os.chmod(chromedriver_path, 0o755)
-
-    # ✅ Prepend ChromeDriver directory to PATH so Selenium can find it
-    os.environ["PATH"] = os.path.dirname(chromedriver_path) + os.pathsep + os.environ.get("PATH", "")
 
     opts = Options()
     opts.add_argument("--headless=new")
@@ -85,8 +83,11 @@ def new_browser() -> Browser:
     opts.add_argument("--window-size=1920,1080")
     opts.binary_location = "/usr/bin/google-chrome"
 
-    # ✅ Let Splinter find chromedriver automatically via PATH
-    return Browser("chrome", options=opts)
+    # ✅ Explicitly create a Chrome Service using the driver path
+    service = Service(executable_path=chromedriver_path)
+
+    # ✅ Pass service + options directly to Splinter
+    return Browser("chrome", options=opts, service=service)
 def visit_with_retry(browser: Browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
     for i in range(tries):
