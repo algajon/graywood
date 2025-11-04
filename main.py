@@ -79,32 +79,22 @@ def human_settle(browser, settle_seconds=0.8):
     time.sleep(settle_seconds)
 
 def new_browser():
-    # Install ChromeDriver into a writable temp directory
-    driver_path = chromedriver_autoinstaller.install(path=tempfile.gettempdir())
-    os.chmod(driver_path, 0o755)
+    from selenium.webdriver.chrome.service import Service
 
     options = Options()
-    # Container-safe flags
-    options.add_argument("--headless")  # more compatible than --headless=new
+    options.add_argument("--headless")  # classic headless is more stable
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--window-size=1920,1080")
 
-    # Try common Chrome/Chromium locations
-    possible_binaries = [
-        "/usr/bin/google-chrome",
-        "/usr/bin/google-chrome-stable",
-        "/usr/bin/chromium-browser",
-        "/usr/bin/chromium",
-    ]
-    for path in possible_binaries:
-        if os.path.exists(path):
-            options.binary_location = path
-            break
+    # Chromium binary installed by apt
+    options.binary_location = "/usr/bin/chromium"
 
-    service = Service(executable_path=driver_path)
+    # Matching chromedriver installed by apt
+    service = Service(executable_path="/usr/bin/chromedriver")
+
     driver = webdriver.Chrome(service=service, options=options)
     return driver
 
