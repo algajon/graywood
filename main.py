@@ -11,11 +11,12 @@ from pydantic import BaseModel, Field
 from splinter import Browser
 from bs4 import BeautifulSoup
 from selenium.webdriver.chrome.options import Options
+import chromedriver_autoinstaller  # ✅ Added to auto-install matching ChromeDriver
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.2.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.2.1")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -59,7 +60,7 @@ def wait_for_dom(browser, css_selector="body", timeout=10):
 
 def human_settle(browser, settle_seconds=0.8):
     try:
-        browser.execute_script("window.scrollTo(0, 250);"); time.sleep(0.2)
+        browser.execute_script("window.scrollTo(0, 250)"); time.sleep(0.2)
         browser.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.35)"); time.sleep(0.2)
         browser.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.70)"); time.sleep(0.2)
         browser.execute_script("window.scrollTo(0, document.body.scrollHeight * 0.95)")
@@ -68,6 +69,9 @@ def human_settle(browser, settle_seconds=0.8):
     time.sleep(settle_seconds)
 
 def new_browser() -> Browser:
+    # ✅ Automatically installs the correct ChromeDriver version
+    chromedriver_autoinstaller.install()
+
     opts = Options()
     opts.add_argument("--headless=new")
     opts.add_argument("--no-sandbox")
@@ -76,7 +80,7 @@ def new_browser() -> Browser:
     opts.add_argument("--window-size=1920,1080")
     opts.binary_location = "/usr/bin/google-chrome"
     return Browser("chrome", options=opts)
-    
+
 def visit_with_retry(browser: Browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
     for i in range(tries):
@@ -110,13 +114,13 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     soup = BeautifulSoup(page_html, 'html.parser')
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
-        href = link["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = link["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
-        href = a["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
-        href = a2["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a2["href"]; return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
