@@ -79,24 +79,30 @@ def human_settle(browser, settle_seconds=0.8):
     time.sleep(settle_seconds)
 
 def new_browser():
-    from selenium.webdriver.chrome.service import Service
-
     options = Options()
-    options.add_argument("--headless")  # classic headless is more stable
+    # Headless + container-safe flags
+    options.add_argument("--headless")  # classic headless is safest
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--window-size=1920,1080")
 
-    # Chromium binary installed by apt
-    options.binary_location = "/usr/bin/chromium"
+    # Use dedicated, writable profile/cache dirs in /tmp
+    options.add_argument("--user-data-dir=/tmp/chrome-user-data")
+    options.add_argument("--data-path=/tmp/chrome-data")
+    options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
+    options.add_argument("--remote-debugging-port=9222")
 
-    # Matching chromedriver installed by apt
-    service = Service(executable_path="/usr/bin/chromedriver")
+    # chromedriver + chromium installed via apt
+    service = Service(
+        executable_path="/usr/bin/chromedriver",
+        log_path="/tmp/chromedriver.log",
+    )
 
     driver = webdriver.Chrome(service=service, options=options)
     return driver
+
 
 def visit_with_retry(browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
