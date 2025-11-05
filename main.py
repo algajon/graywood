@@ -375,13 +375,22 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
     except Exception as e:
         try:
-            browser.quit()
+            if browser is not None:
+                browser.quit()
         except Exception:
             pass
+
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
         RUNS[run_id]["logs"].append(f"ERROR: {e}")
 
+        # Attach tail of ChromeDriver verbose log if available
+        try:
+            with open("/tmp/chromedriver.log", "r") as f:
+                lines = f.readlines()[-40:]
+            RUNS[run_id]["logs"].append("CHROMEDRIVER LOG TAIL:\n" + "".join(lines))
+        except Exception:
+            pass
 # ---------------- FastAPI endpoints ----------------
 @app.post("/scrape", response_model=StartResponse)
 def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
