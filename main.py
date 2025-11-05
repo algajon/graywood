@@ -18,11 +18,13 @@ from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
 import os
+import shutil
+import subprocess
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.3.3")
+app = FastAPI(title="Kijiji Scraper API", version="0.3.4")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -76,20 +78,54 @@ def human_settle(browser, settle_seconds=0.8):
         pass
     time.sleep(settle_seconds)
 
-def new_browser():
+def new_browser(run_id: str):
+    # Probe chrome + chromedriver availability and versions
+    try:
+        chrome_candidates = [
+            os.getenv("GOOGLE_CHROME_SHIM"),
+            "/usr/bin/google-chrome",
+            "/usr/bin/google-chrome-stable",
+            "/usr/bin/chromium",
+            "/usr/bin/chromium-browser",
+        ]
+        chrome_candidates = [c for c in chrome_candidates if c and os.path.exists(c)]
+
+        chrome_path = chrome_candidates[0] if chrome_candidates else shutil.which("google-chrome") \
+            or shutil.which("chromium") or shutil.which("chromium-browser")
+
+        log(run_id, f"DEBUG: chrome_path={chrome_path}")
+
+        if chrome_path:
+            try:
+                out = subprocess.run(
+                    [chrome_path, "--version"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                log(run_id, f"DEBUG: chrome --version stdout='{out.stdout.strip()}' stderr='{out.stderr.strip()}'")
+            except Exception as e:
+                log(run_id, f"DEBUG: error running chrome --version: {e}")
+        else:
+            log(run_id, "DEBUG: no chrome binary found in PATH or known locations")
+
+        driver_path = "/usr/bin/chromedriver" if os.path.exists("/usr/bin/chromedriver") else shutil.which("chromedriver")
+        log(run_id, f"DEBUG: chromedriver path={driver_path}")
+    except Exception as e:
+        log(run_id, f"DEBUG: error probing chrome/chromedriver: {e}")
+        driver_path = "/usr/bin/chromedriver"
+        chrome_path = None
+
     # Log Chrome output to file so we can inspect on failure
     os.environ.setdefault("CHROME_LOG_FILE", "/tmp/chrome_debug.log")
 
     options = Options()
-    # Headless + container-safe flags
-    options.add_argument("--headless=new")
+    # Classic headless; tends to be most compatible
+    options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
-    options.add_argument("--disable-software-rasterizer")
     options.add_argument("--window-size=1920,1080")
-    options.add_argument("--no-zygote")
-    options.add_argument("--single-process")
     options.add_argument("--enable-logging")
     options.add_argument("--log-level=0")
 
@@ -99,12 +135,11 @@ def new_browser():
     options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
     options.add_argument("--remote-debugging-port=9222")
 
-    # Explicitly point to Chromium binary installed via apt
-    options.binary_location = "/usr/bin/chromium"
+    if chrome_path:
+        options.binary_location = chrome_path
 
-    # Chromedriver + Chromium installed via apt (see Dockerfile)
     service = Service(
-        executable_path="/usr/bin/chromedriver",
+        executable_path=driver_path or "/usr/bin/chromedriver",
         log_path="/tmp/chromedriver.log",
         service_args=[
             "--allowed-ips=",
@@ -113,8 +148,13 @@ def new_browser():
         ],
     )
 
-    driver = webdriver.Chrome(service=service, options=options)
-    return driver
+    try:
+        driver = webdriver.Chrome(service=service, options=options)
+        return driver
+    except Exception as e:
+        # Log full error here too
+        log(run_id, f"DEBUG: webdriver.Chrome() failed: {repr(e)}")
+        raise
 
 def visit_with_retry(browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
@@ -261,12 +301,14 @@ def run_scrape(run_id: str, params: ScrapeParams):
     RUNS[run_id].update(status="running", started_at=datetime.utcnow(), results=[], count=0)
     browser = None
     try:
+        log(run_id, f"DEBUG: run_scrape start base_url={params.base_url} max_listings={params.max_listings}")
+
         realtor_filter = re.compile(
             r"MGMT|Property\s?Management|deferral|sublease|free|property\s?manager|realty|mls|third\s?party|third\s?parties",
             re.IGNORECASE,
         )
 
-        browser = new_browser()
+        browser = new_browser(run_id)
         current_url = params.base_url
         scraped_urls = set()
         scraped_count = 0
