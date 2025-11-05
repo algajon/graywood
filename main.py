@@ -22,7 +22,7 @@ import os
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.3.2")
+app = FastAPI(title="Kijiji Scraper API", version="0.3.3")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -77,14 +77,21 @@ def human_settle(browser, settle_seconds=0.8):
     time.sleep(settle_seconds)
 
 def new_browser():
+    # Log Chrome output to file so we can inspect on failure
+    os.environ.setdefault("CHROME_LOG_FILE", "/tmp/chrome_debug.log")
+
     options = Options()
     # Headless + container-safe flags
-    options.add_argument("--headless")  # classic headless is safest
+    options.add_argument("--headless=new")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
     options.add_argument("--disable-software-rasterizer")
     options.add_argument("--window-size=1920,1080")
+    options.add_argument("--no-zygote")
+    options.add_argument("--single-process")
+    options.add_argument("--enable-logging")
+    options.add_argument("--log-level=0")
 
     # Use dedicated, writable profile/cache dirs in /tmp
     options.add_argument("--user-data-dir=/tmp/chrome-user-data")
@@ -92,14 +99,17 @@ def new_browser():
     options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
     options.add_argument("--remote-debugging-port=9222")
 
+    # Explicitly point to Chromium binary installed via apt
+    options.binary_location = "/usr/bin/chromium"
+
     # Chromedriver + Chromium installed via apt (see Dockerfile)
     service = Service(
         executable_path="/usr/bin/chromedriver",
         log_path="/tmp/chromedriver.log",
         service_args=[
-            "--allowed-ips=",       # allow all IPs (disable local-only restriction)
-            "--whitelisted-ips=",   # legacy name, kept for compatibility
-            "--allowed-origins=*"   # be permissive with origins
+            "--allowed-ips=",
+            "--whitelisted-ips=",
+            "--allowed-origins=*",
         ],
     )
 
@@ -408,6 +418,14 @@ def run_scrape(run_id: str, params: ScrapeParams):
             with open("/tmp/chromedriver.log", "r") as f:
                 lines = f.readlines()[-40:]
             RUNS[run_id]["logs"].append("CHROMEDRIVER LOG TAIL:\n" + "".join(lines))
+        except Exception:
+            pass
+
+        # Attach tail of Chrome's own debug log if available
+        try:
+            with open("/tmp/chrome_debug.log", "r") as f:
+                lines = f.readlines()[-40:]
+            RUNS[run_id]["logs"].append("CHROME DEBUG LOG TAIL:\n" + "".join(lines))
         except Exception:
             pass
 
