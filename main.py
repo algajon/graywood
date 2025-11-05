@@ -17,14 +17,12 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 
-import chromedriver_autoinstaller
 import os
-import tempfile
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.3.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.3.2")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -94,15 +92,19 @@ def new_browser():
     options.add_argument("--disk-cache-dir=/tmp/chrome-cache")
     options.add_argument("--remote-debugging-port=9222")
 
-    # chromedriver + chromium installed via apt
+    # Chromedriver + Chromium installed via apt (see Dockerfile)
     service = Service(
         executable_path="/usr/bin/chromedriver",
         log_path="/tmp/chromedriver.log",
+        service_args=[
+            "--allowed-ips=",       # allow all IPs (disable local-only restriction)
+            "--whitelisted-ips=",   # legacy name, kept for compatibility
+            "--allowed-origins=*"   # be permissive with origins
+        ],
     )
 
     driver = webdriver.Chrome(service=service, options=options)
     return driver
-
 
 def visit_with_retry(browser, url: str, tries: int = 3, wait_css="body"):
     last_err = None
@@ -122,10 +124,12 @@ def get_listing_links_from_html(html: str) -> List[str]:
     hrefs = set()
     for a in soup.select('a[data-testid="listing-link"]'):
         href = a.get("href")
-        if href: hrefs.add(href)
+        if href:
+            hrefs.add(href)
     for a in soup.select('a[href*="/v-apartments-condos/"], a[href*="/v-real-estate/"]'):
         href = a.get("href")
-        if href: hrefs.add(href)
+        if href:
+            hrefs.add(href)
     abs_hrefs = []
     for href in hrefs:
         if not href.startswith("http"):
@@ -137,19 +141,24 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     soup = BeautifulSoup(page_html, 'html.parser')
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
-        href = link["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = link["href"]
+        return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
-        href = a["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a["href"]
+        return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
-        href = a2["href"];  return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+        href = a2["href"]
+        return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
     if "page" in q and q["page"]:
-        try: cur = int(q["page"][0])
-        except Exception: cur = 1
+        try:
+            cur = int(q["page"][0])
+        except Exception:
+            cur = 1
     q["page"] = [str(cur + 1)]
     new_qs = urlencode({k: v[0] if isinstance(v, list) else v for k, v in q.items()})
     next_url = urlunparse((parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_qs, parsed.fragment))
@@ -175,7 +184,8 @@ def to_e164_from_digits(digits: str) -> str:
     return cand if is_valid_nanp(cand) else ""
 
 def normalize_tel_href_or_text(raw: str) -> str:
-    if not raw: return ""
+    if not raw:
+        return ""
     if raw.lower().startswith("tel:"):
         raw = raw[4:]
     return to_e164_from_digits(raw)
@@ -193,9 +203,11 @@ def find_phone_from_reveal(soup: BeautifulSoup) -> str:
     return ""
 
 def find_phone_in_description(text: str) -> str:
-    if not text: return ""
+    if not text:
+        return ""
     m = PLUS1_IN_DESC.search(text)
-    if not m: return ""
+    if not m:
+        return ""
     return to_e164_from_digits("".join(m.groups()))
 
 def extract_description_text(soup: BeautifulSoup) -> str:
@@ -237,6 +249,7 @@ def extract_available_date_from_details(soup: BeautifulSoup) -> str:
 # ---------------- The scraper ----------------
 def run_scrape(run_id: str, params: ScrapeParams):
     RUNS[run_id].update(status="running", started_at=datetime.utcnow(), results=[], count=0)
+    browser = None
     try:
         realtor_filter = re.compile(
             r"MGMT|Property\s?Management|deferral|sublease|free|property\s?manager|realty|mls|third\s?party|third\s?parties",
@@ -397,6 +410,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
             RUNS[run_id]["logs"].append("CHROMEDRIVER LOG TAIL:\n" + "".join(lines))
         except Exception:
             pass
+
 # ---------------- FastAPI endpoints ----------------
 @app.post("/scrape", response_model=StartResponse)
 def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
