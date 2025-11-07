@@ -279,18 +279,40 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 soup = BeautifulSoup(detail_html, "html.parser")
 
-                # Description + seller + title (for realtor filtering)
+                # Core text pieces we inspect
                 description = extract_description_text(soup)
                 prospect_name, profile_url = extract_seller_info(soup)
+
                 title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find("h1")
                 title_text = title_el.get_text(" ", strip=True) if title_el else ""
 
+                # First email pass from description (used for filtering; reused later)
+                emails = re.findall(
+                    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
+                    description or "",
+                )
+                email = emails[0] if emails else ""
+
+                # Realtor-style keyword filter
                 filter_text = " ".join(
                     t for t in [description, prospect_name, title_text] if t
                 )
-
                 if realtor_filter.search(filter_text):
                     log(run_id, f"Skipped {href} — realtor / management keywords.")
+                    continue
+
+                # Extra residential filters:
+                #  - "residential" in name
+                #  - "residential" anywhere in email address (domain or local part)
+                name_l = (prospect_name or "").lower()
+                email_l = (email or "").lower()
+                if "residential" in name_l or "residential" in email_l:
+                    log(run_id, f"Skipped {href} — 'residential' in name/email.")
+                    continue
+
+                # Corporate profile logo (e.g. Realstar logo block)
+                if soup.select_one("img[data-testid='profile-logo']"):
+                    log(run_id, f"Skipped {href} — corporate profile logo present.")
                     continue
 
                 # PHONE: tel: link or +1 in description / page text
@@ -324,12 +346,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 available_date = extract_available_date_from_details(soup)
 
-                emails = re.findall(
-                    r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
-                    description or "",
-                )
-                email = emails[0] if emails else ""
-
+                # (email already computed above)
                 row = {
                     "Mobile": phone_number,
                     "Email": email,
