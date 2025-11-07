@@ -79,49 +79,35 @@ def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str
 def get_listing_links_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, 'html.parser')
     hrefs = set()
-
-    # Primary listing anchors
     for a in soup.select('a[data-testid="listing-link"]'):
         href = a.get("href")
         if href:
             hrefs.add(href)
-
-    # Fallback: apartments/condos + real estate URLs
     for a in soup.select('a[href*="/v-apartments-condos/"], a[href*="/v-real-estate/"]'):
         href = a.get("href")
         if href:
             hrefs.add(href)
-
     abs_hrefs = []
     for href in hrefs:
         if not href.startswith("http"):
             href = "https://www.kijiji.ca" + href
         abs_hrefs.append(href)
-
-    # preserve order, remove dupes
     return list(dict.fromkeys(abs_hrefs))
 
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     soup = BeautifulSoup(page_html, 'html.parser')
-
-    # <link rel="next">
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
         href = link["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
-
-    # "Next" buttons/anchors
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
         href = a["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
-
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
         href = a2["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
-
-    # Fallback: increment ?page=N param
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
@@ -168,7 +154,7 @@ def normalize_tel_href_or_text(raw: str) -> str:
     return to_e164_from_digits(raw)
 
 def find_phone_from_reveal(soup: BeautifulSoup) -> str:
-    # Any tel: link or visible phone text in HTML.
+    # Here "reveal" just means any tel: link or visible phone text in HTML.
     a = soup.find('a', href=ANY_TEL)
     if a:
         cand = normalize_tel_href_or_text(a.get("href", "")) or normalize_tel_href_or_text(
@@ -176,7 +162,6 @@ def find_phone_from_reveal(soup: BeautifulSoup) -> str:
         )
         if cand:
             return cand
-
     txt = soup.get_text(" ", strip=True)
     m = ANY_PHONE_TEXT.search(txt)
     if m:
@@ -316,18 +301,16 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — realtor / management keywords.")
                     continue
 
-                # Extra filters on seller name/email:
-                #  - "residential" or "apartments" in seller name
-                #  - "residential" or "apartments" anywhere in email address
+                # Extra residential filters:
+                #  - "residential" in name
+                #  - "residential" anywhere in email address (domain or local part)
                 name_l = (prospect_name or "").lower()
                 email_l = (email or "").lower()
-                if any(bad in name_l for bad in ("residential", "apartments")) or any(
-                    bad in email_l for bad in ("residential", "apartments")
-                ):
-                    log(run_id, f"Skipped {href} — blocked keyword in name/email.")
+                if "residential" in name_l or "residential" in email_l:
+                    log(run_id, f"Skipped {href} — 'residential' in name/email.")
                     continue
 
-                # Corporate profile logo (e.g. Realstar logo block, property mgmt brands)
+                # Corporate profile logo (e.g. Realstar logo block)
                 if soup.select_one("img[data-testid='profile-logo']"):
                     log(run_id, f"Skipped {href} — corporate profile logo present.")
                     continue
@@ -363,6 +346,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 available_date = extract_available_date_from_details(soup)
 
+                # (email already computed above)
                 row = {
                     "Mobile": phone_number,
                     "Email": email,
@@ -480,5 +464,5 @@ def export_csv(run_id: str):
     return StreamingResponse(
         buf,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename="{run_id}.csv"'},
+        headers={"Content-Disposition": f'attachment; filename=\"{run_id}.csv\"'},
     )
