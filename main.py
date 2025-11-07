@@ -224,23 +224,24 @@ def run_scrape(run_id: str, params: ScrapeParams):
         )
 
         # Realtor / property-management filter.
-        # Applied ONLY to description + seller name + listing title, not whole page HTML.
+        # Applied ONLY to description + seller name + listing title.
         realtor_filter = re.compile(
             r"""
+              \brealstar\b|
               \bmgmt\b|
+              \bon[-\s]?site\s+management\b|
               \bproperty\s*management\b|
               \bmanagement\s+company\b|
               \bproperty\s*manager(s)?\b|
               \brealty\b|
               \brealt(or|ors)\b|
               \breal\s*estate\s+(agent|broker|brokerage|team)\b|
-              \bbroker(age)?\b|
-              \bleasing\s*agent\b|
+              \b(leasing|rental)\s+agent\b|
               \blisting\s*agent\b|
-              \b(rental|rentals?)\s+agency\b|
-              \brentalagency\b|
-              \brentals?\s+(inc|ltd|corp|company|management|mgmt|realty|group)\b|
+              \bbroker(age)?\b|
+              \brentals?\s+(inc|ltd|corp|company|management|mgmt|realty|group|team)\b|
               \bmls\b|
+              \bmultiple\s+listing\s+service\b|
               \bthird\s*party\b|
               \bthird\s*parties\b|
               \bsublease\b|
