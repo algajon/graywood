@@ -223,9 +223,31 @@ def run_scrape(run_id: str, params: ScrapeParams):
             f"DEBUG: run_scrape start base_url={params.base_url} max_listings={params.max_listings}",
         )
 
+        # Much stricter realtor / property-management filter
         realtor_filter = re.compile(
-            r"MGMT|Property\s?Management|deferral|sublease|free|property\s?manager|realty|mls|third\s?party|third\s?parties",
-            re.IGNORECASE,
+            r"""
+              \bmgmt\b|
+              \bproperty\s*management\b|
+              \bmanagement\b|
+              \bproperty\s*manager(s)?\b|
+              \brealty\b|
+              \brealt(or|ors)\b|
+              \breal\s*estate\s*agent\b|
+              \breal\s*estate\s*broker\b|
+              \breal\s*estate\s*team\b|
+              \bbroker(age)?\b|
+              \bagent(s)?\b|
+              \bleasing\s*agent\b|
+              \blisting\s*agent\b|
+              \brentals\b|
+              \bmls\b|
+              \bmultiple\s+listing\s+service\b|
+              \bthird\s*party\b|
+              \bthird\s*parties\b|
+              \bsublease\b|
+              \bdeferral\b
+            """,
+            re.IGNORECASE | re.VERBOSE,
         )
 
         current_url = params.base_url
@@ -257,10 +279,19 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 soup = BeautifulSoup(detail_html, "html.parser")
 
-                # Description
+                # Core text blobs
                 description = extract_description_text(soup)
-                if realtor_filter.search(description):
-                    log(run_id, f"Skipped {href} — realtor keywords.")
+                prospect_name, profile_url = extract_seller_info(soup)
+                title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find("h1")
+                title_text = title_el.get_text(" ", strip=True) if title_el else ""
+                full_text = soup.get_text(" ", strip=True)
+
+                combined_text = " ".join(
+                    t for t in [description, prospect_name, title_text, full_text] if t
+                )
+
+                if realtor_filter.search(combined_text):
+                    log(run_id, f"Skipped {href} — realtor/management keywords detected.")
                     continue
 
                 # PHONE: tel: link or +1 in description / page text
@@ -274,8 +305,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
                         f"Skipped {href} — no valid phone (tel: or +1 in description).",
                     )
                     continue
-
-                prospect_name, profile_url = extract_seller_info(soup)
 
                 asking_price = ""
                 ptag = soup.select_one("p[data-testid='vip-price']")
