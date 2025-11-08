@@ -293,7 +293,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 )
                 email = emails[0] if emails else ""
 
-                # Realtor-style keyword filter
+                # Realtor-style keyword filter (description + seller name + title)
                 filter_text = " ".join(
                     t for t in [description, prospect_name, title_text] if t
                 )
@@ -301,13 +301,19 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — realtor / management keywords.")
                     continue
 
-                # Extra residential filters:
-                #  - "residential" in name
-                #  - "residential" anywhere in email address (domain or local part)
+                # Normalized seller name + email
                 name_l = (prospect_name or "").lower()
                 email_l = (email or "").lower()
+
+                # Skip "residential" in name or email
                 if "residential" in name_l or "residential" in email_l:
                     log(run_id, f"Skipped {href} — 'residential' in name/email.")
+                    continue
+
+                # Skip corporate-style "apartments / rentals / residence" names/emails
+                blocked_brand_bits = ("apartments", "apartment", "rentals", "rental", "residence", "residences")
+                if any(b in name_l for b in blocked_brand_bits) or any(b in email_l for b in blocked_brand_bits):
+                    log(run_id, f"Skipped {href} — apartments/rentals/residence keyword in seller name/email.")
                     continue
 
                 # Corporate profile logo (e.g. Realstar logo block)
@@ -346,7 +352,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 available_date = extract_available_date_from_details(soup)
 
-                # (email already computed above)
                 row = {
                     "Mobile": phone_number,
                     "Email": email,
