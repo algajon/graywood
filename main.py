@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.7.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.8.0")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -79,7 +79,7 @@ def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str
 def canonicalize_listing_url(href: str) -> str:
     """
     Normalize listing URLs so things like ?imageNumber=5 don't create fake duplicates.
-    We keep only scheme + host + path.
+    Keep only scheme + host + path.
     """
     if not href:
         return ""
@@ -95,7 +95,7 @@ def get_listing_links_from_html(html: str) -> List[str]:
 
     - Uses data-testid listing-link where available.
     - Falls back to /v-apartments-condos/ and /v-real-estate/ hrefs.
-    - Dedupes *within the page* while preserving order.
+    - Dedupes within the page while preserving order.
     """
     soup = BeautifulSoup(html, 'html.parser')
     raw_links: List[str] = []
@@ -112,7 +112,7 @@ def get_listing_links_from_html(html: str) -> List[str]:
         if href:
             raw_links.append(canonicalize_listing_url(href))
 
-    # Deduplicate but preserve order (within this page only)
+    # Deduplicate but preserve order within the page
     seen = set()
     abs_hrefs: List[str] = []
     for href in raw_links:
@@ -280,7 +280,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
         )
 
         # Realtor / property-management filter.
-        # Applied ONLY to description + seller name + listing title.
         realtor_filter = re.compile(
             r"""
               \brealstar\b|
@@ -310,12 +309,14 @@ def run_scrape(run_id: str, params: ScrapeParams):
         scraped_count = 0
         page = 1
 
+        # Track which canonical listing URLs we've processed across the entire run
+        seen_listing_urls: set[str] = set()
+
         MAX_RUNTIME_SECONDS = 900  # 15 minutes safety cap
         MAX_PAGES = 150            # avoid infinite pagination loops
         start_ts = time.time()
 
         while scraped_count < params.max_listings and page <= MAX_PAGES:
-            # Time guard
             if time.time() - start_ts > MAX_RUNTIME_SECONDS:
                 log(run_id, "Reached max runtime, stopping.")
                 break
@@ -328,24 +329,30 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 log(run_id, "No listing anchors found on this page. Stopping.")
                 break
 
+            # Only process links we have not seen before in this run
+            new_links: List[str] = []
+            for href in listing_links:
+                if href not in seen_listing_urls:
+                    seen_listing_urls.add(href)
+                    new_links.append(href)
+
             log(
                 run_id,
-                f"Found {len(listing_links)} canonical listing URLs on page {page}. "
-                f"Processing all of them.",
+                f"Found {len(listing_links)} canonical listing URLs on page {page}, "
+                f"{len(new_links)} new (unseen this run).",
             )
 
             page_saved_before = scraped_count
             processed_on_page = 0
 
-            for href in listing_links:
+            for href in new_links:
                 if scraped_count >= params.max_listings:
                     break
                 processed_on_page += 1
 
                 try:
                     detail_html = fetch_html(run_id, href)
-                    # polite delay
-                    time.sleep(1.0)
+                    time.sleep(1.0)  # be polite
                 except Exception as e:
                     log(run_id, f"Skipped {href} — failed to open ({e})")
                     continue
@@ -462,7 +469,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
             page_saved = scraped_count - page_saved_before
             log(
                 run_id,
-                f"Page {page} summary: {processed_on_page} canonical listings processed on this page, "
+                f"Page {page} summary: {processed_on_page} new canonical listings processed on this page, "
                 f"{page_saved} leads saved on this page.",
             )
 
@@ -480,8 +487,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
             current_url = next_url
             page += 1
-            # Be polite between pages to reduce throttling
-            time.sleep(2.0)
+            time.sleep(2.0)  # polite between pages
 
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
