@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.8.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.9.0")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -78,8 +78,7 @@ def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str
 
 def canonicalize_listing_url(href: str) -> str:
     """
-    Normalize listing URLs so things like ?imageNumber=5 don't create fake duplicates.
-    Keep only scheme + host + path.
+    Normalize listing URLs so ?imageNumber etc. don't matter.
     """
     if not href:
         return ""
@@ -91,11 +90,7 @@ def canonicalize_listing_url(href: str) -> str:
 
 def get_listing_links_from_html(html: str) -> List[str]:
     """
-    Extract *canonical* listing URLs from a search page.
-
-    - Uses data-testid listing-link where available.
-    - Falls back to /v-apartments-condos/ and /v-real-estate/ hrefs.
-    - Dedupes within the page while preserving order.
+    Extract canonical listing URLs from a search page.
     """
     soup = BeautifulSoup(html, 'html.parser')
     raw_links: List[str] = []
@@ -112,7 +107,7 @@ def get_listing_links_from_html(html: str) -> List[str]:
         if href:
             raw_links.append(canonicalize_listing_url(href))
 
-    # Deduplicate but preserve order within the page
+    # Deduplicate within THIS PAGE only, preserve order
     seen = set()
     abs_hrefs: List[str] = []
     for href in raw_links:
@@ -125,45 +120,34 @@ def get_listing_links_from_html(html: str) -> List[str]:
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     """
     Robust 'next page' detection for Kijiji search pages.
-    Tries several modern + legacy patterns before falling back to ?page=N.
     """
     soup = BeautifulSoup(page_html, 'html.parser')
 
-    # 1) <link rel="next" ...>
+    # 1) <link rel="next">
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
         href = link["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 2) <a aria-label="Next"> style buttons
+    # 2) aria-label="Next"
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
         href = a["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 3) Links whose visible text is "Next"
+    # 3) text "Next"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
         href = a2["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 4) Newer Kijiji pagination: data-testid
+    # 4) data-testid pagination-next-link
     btn = soup.select_one('a[data-testid="pagination-next-link"]')
     if btn and btn.get("href"):
         href = btn["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 5) Numbered pagination: current li + next sibling
-    cur_page = soup.select_one('li.pagination-selected')
-    if cur_page:
-        next_li = cur_page.find_next_sibling("li")
-        if next_li:
-            link = next_li.find("a", href=True)
-            if link:
-                href = link["href"]
-                return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
-
-    # 6) Fallback: increment ?page=N in the URL
+    # 5) fallback: increment ?page=N
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
@@ -210,7 +194,6 @@ def normalize_tel_href_or_text(raw: str) -> str:
     return to_e164_from_digits(raw)
 
 def find_phone_from_reveal(soup: BeautifulSoup) -> str:
-    # "Reveal" = any tel: link or visible phone text in the HTML.
     a = soup.find('a', href=ANY_TEL)
     if a:
         cand = normalize_tel_href_or_text(a.get("href", "")) or normalize_tel_href_or_text(
@@ -241,7 +224,7 @@ def extract_description_text(soup: BeautifulSoup) -> str:
     txt = re.sub(r"\b(Social\s*(Lead)?\s*ID)\s*\d+\b", " ", txt, flags=re.I)
     return txt
 
-# ----------- Seller (username) helpers -----------
+# ----------- Seller helpers -----------
 PROFILE_HREF_RE = re.compile(r"^/(o-profile|o-kijiji-user|o-[a-z0-9\-]+)/", re.I)
 
 def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
@@ -279,7 +262,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
             f"DEBUG: run_scrape start base_url={params.base_url} max_listings={params.max_listings}",
         )
 
-        # Realtor / property-management filter.
         realtor_filter = re.compile(
             r"""
               \brealstar\b|
@@ -309,11 +291,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
         scraped_count = 0
         page = 1
 
-        # Track which canonical listing URLs we've processed across the entire run
-        seen_listing_urls: set[str] = set()
+        # Only used to avoid saving *exact same* listing URL multiple times
+        saved_listing_urls: set[str] = set()
 
-        MAX_RUNTIME_SECONDS = 900  # 15 minutes safety cap
-        MAX_PAGES = 150            # avoid infinite pagination loops
+        MAX_RUNTIME_SECONDS = 900
+        MAX_PAGES = 150
         start_ts = time.time()
 
         while scraped_count < params.max_listings and page <= MAX_PAGES:
@@ -329,25 +311,18 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 log(run_id, "No listing anchors found on this page. Stopping.")
                 break
 
-            # Only process links we have not seen before in this run
-            new_links: List[str] = []
-            for href in listing_links:
-                if href not in seen_listing_urls:
-                    seen_listing_urls.add(href)
-                    new_links.append(href)
-
             log(
                 run_id,
-                f"Found {len(listing_links)} canonical listing URLs on page {page}, "
-                f"{len(new_links)} new (unseen this run).",
+                f"Found {len(listing_links)} canonical listing URLs on page {page}.",
             )
 
             page_saved_before = scraped_count
             processed_on_page = 0
 
-            for href in new_links:
+            for href in listing_links:
                 if scraped_count >= params.max_listings:
                     break
+
                 processed_on_page += 1
 
                 try:
@@ -359,21 +334,20 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 soup = BeautifulSoup(detail_html, "html.parser")
 
-                # Core text pieces we inspect
                 description = extract_description_text(soup)
                 prospect_name, profile_url = extract_seller_info(soup)
 
                 title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find("h1")
                 title_text = title_el.get_text(" ", strip=True) if title_el else ""
 
-                # First email pass from description (used for filtering; reused later)
+                # First email pass from description
                 emails = re.findall(
                     r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
                     description or "",
                 )
                 email = emails[0] if emails else ""
 
-                # Realtor-style keyword filter (description + seller name + title)
+                # Realtor / management filter
                 filter_text = " ".join(
                     t for t in [description, prospect_name, title_text] if t
                 )
@@ -381,16 +355,13 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — realtor / management keywords.")
                     continue
 
-                # Normalized seller name + email
                 name_l = (prospect_name or "").lower()
                 email_l = (email or "").lower()
 
-                # Skip "residential" in name or email
                 if "residential" in name_l or "residential" in email_l:
                     log(run_id, f"Skipped {href} — 'residential' in name/email.")
                     continue
 
-                # Skip corporate-style "apartments / rentals / residence" names/emails
                 blocked_brand_bits = (
                     "apartments",
                     "apartment",
@@ -408,12 +379,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     )
                     continue
 
-                # Corporate profile logo (e.g. Realstar logo block)
                 if soup.select_one("img[data-testid='profile-logo']"):
                     log(run_id, f"Skipped {href} — corporate profile logo present.")
                     continue
 
-                # PHONE: tel: link or +1 / 10-digit number in description / page text
+                # PHONE
                 phone_number = find_phone_from_reveal(soup)
                 if not phone_number:
                     phone_number = find_phone_in_description(description)
@@ -444,6 +414,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 available_date = extract_available_date_from_details(soup)
 
+                # Dedup by listing URL at SAVE time (we still *visited* it)
+                if href in saved_listing_urls:
+                    log(run_id, f"Already saved lead for {href} earlier in this run; skipping duplicate save.")
+                    continue
+
                 row = {
                     "Mobile": phone_number,
                     "Email": email,
@@ -455,13 +430,14 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     "Available Date": available_date,
                     "City of Unit": city,
                     "Asking Price": asking_price,
-                    "Listing Profile URL": href,  # canonical URL
+                    "Listing Profile URL": href,
                     "Profile URL": profile_url,
                 }
                 for k, v in row.items():
                     row[k] = "" if v is None else str(v).replace("\n", " ").strip()
 
                 RUNS[run_id]["results"].append(row)
+                saved_listing_urls.add(href)
                 scraped_count += 1
                 RUNS[run_id]["count"] = scraped_count
                 log(run_id, f"Saved {scraped_count}/{params.max_listings}")
@@ -469,7 +445,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
             page_saved = scraped_count - page_saved_before
             log(
                 run_id,
-                f"Page {page} summary: {processed_on_page} new canonical listings processed on this page, "
+                f"Page {page} summary: {processed_on_page} listing URLs processed on this page, "
                 f"{page_saved} leads saved on this page.",
             )
 
@@ -487,7 +463,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
             current_url = next_url
             page += 1
-            time.sleep(2.0)  # polite between pages
+            time.sleep(2.0)
 
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
@@ -503,7 +479,7 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
     run_id = str(uuid.uuid4())
     RUNS[run_id] = {
         "status": "queued",
-        "params": payload.dict(),  # pydantic v1/v2 compatible
+        "params": payload.dict(),
         "results": [],
         "logs": [],
         "count": 0,
