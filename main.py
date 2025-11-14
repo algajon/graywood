@@ -1,4 +1,4 @@
-import re, csv, time, uuid
+import re, csv, time, uuid, random
 from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
@@ -14,9 +14,8 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.9.0")
+app = FastAPI(title="Kijiji Scraper API", version="1.0.0")
 
-# Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
@@ -62,92 +61,97 @@ class RunStatus(BaseModel):
 def log(run_id: str, msg: str):
     RUNS[run_id]["logs"].append(msg)
 
-def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str:
+def fetch_html(run_id: str, url: str, tries: int = 4, base_delay: float = 2.0) -> str:
+    """
+    Generic HTML fetcher with special handling for HTTP 429.
+    - For 429: back off more aggressively, then retry.
+    - For other 4xx/5xx: raise after logging.
+    """
     last_err = None
     for i in range(tries):
         try:
-            resp = SESSION.get(url, headers=HEADERS, timeout=15)
-            if resp.status_code >= 400:
-                raise RuntimeError(f"HTTP {resp.status_code}")
+            resp = SESSION.get(url, headers=HEADERS, timeout=20)
+            status = resp.status_code
+
+            if status == 429:
+                wait_for = base_delay * (i + 1) * 3  # e.g. 6, 12, 18, 24 sec
+                log(run_id, f"fetch_html HTTP 429 on {url} (attempt {i+1}/{tries}), backing off {wait_for:.1f}s")
+                time.sleep(wait_for)
+                last_err = RuntimeError("HTTP 429")
+                continue
+
+            if status >= 400:
+                raise RuntimeError(f"HTTP {status}")
+
             return resp.text
+
         except Exception as e:
             last_err = e
             log(run_id, f"fetch_html error on {url}: {e}")
-            time.sleep(delay * (i + 1))
+            # jitter so we don't look perfectly robotic
+            sleep_for = base_delay * (i + 1) + random.uniform(0, 1.5)
+            time.sleep(sleep_for)
+
+    # after all tries
     raise last_err if last_err else RuntimeError("fetch failed")
 
 def canonicalize_listing_url(href: str) -> str:
-    """
-    Normalize listing URLs so ?imageNumber etc. don't matter.
-    """
     if not href:
         return ""
     if not href.startswith("http"):
         href = "https://www.kijiji.ca" + href
     parsed = urlparse(href)
-    clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
-    return clean
+    return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
 def get_listing_links_from_html(html: str) -> List[str]:
-    """
-    Extract canonical listing URLs from a search page.
-    """
     soup = BeautifulSoup(html, 'html.parser')
     raw_links: List[str] = []
 
-    # Primary selector (current Kijiji markup)
     for a in soup.select('a[data-testid="listing-link"]'):
         href = a.get("href")
         if href:
             raw_links.append(canonicalize_listing_url(href))
 
-    # Fallback selectors
+    # fallback selectors
     for a in soup.select('a[href*="/v-apartments-condos/"], a[href*="/v-real-estate/"]'):
         href = a.get("href")
         if href:
             raw_links.append(canonicalize_listing_url(href))
 
-    # Deduplicate within THIS PAGE only, preserve order
     seen = set()
-    abs_hrefs: List[str] = []
+    result: List[str] = []
     for href in raw_links:
         if href and href not in seen:
             seen.add(href)
-            abs_hrefs.append(href)
-
-    return abs_hrefs
+            result.append(href)
+    return result
 
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
-    """
-    Robust 'next page' detection for Kijiji search pages.
-    """
     soup = BeautifulSoup(page_html, 'html.parser')
 
-    # 1) <link rel="next">
+    # link rel="next"
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
         href = link["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 2) aria-label="Next"
+    # aria-label / text "Next"
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
         href = a["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 3) text "Next"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
         href = a2["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 4) data-testid pagination-next-link
     btn = soup.select_one('a[data-testid="pagination-next-link"]')
     if btn and btn.get("href"):
         href = btn["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # 5) fallback: increment ?page=N
+    # final fallback: increment ?page=N
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
@@ -179,12 +183,12 @@ def is_valid_nanp(e164: str) -> bool:
 def to_e164_from_digits(digits: str) -> str:
     digits = re.sub(r"\D+", "", digits or "")
     if len(digits) == 11 and digits.startswith("1"):
-        cand = f"+{digits}"
+        candidate = f"+{digits}"
     elif len(digits) == 10:
-        cand = f"+1{digits}"
+        candidate = f"+1{digits}"
     else:
         return ""
-    return cand if is_valid_nanp(cand) else ""
+    return candidate if is_valid_nanp(candidate) else ""
 
 def normalize_tel_href_or_text(raw: str) -> str:
     if not raw:
@@ -224,7 +228,7 @@ def extract_description_text(soup: BeautifulSoup) -> str:
     txt = re.sub(r"\b(Social\s*(Lead)?\s*ID)\s*\d+\b", " ", txt, flags=re.I)
     return txt
 
-# ----------- Seller helpers -----------
+# ----------- Seller / meta helpers -----------
 PROFILE_HREF_RE = re.compile(r"^/(o-profile|o-kijiji-user|o-[a-z0-9\-]+)/", re.I)
 
 def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
@@ -240,7 +244,6 @@ def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
     url = ("https://www.kijiji.ca" + a["href"]) if (a and a.get("href")) else ""
     return name, url
 
-# ----------- Availability helpers -----------
 AVAILABLE_P_RE = re.compile(r"^\s*Available\b", re.I)
 
 def extract_available_date_from_details(soup: BeautifulSoup) -> str:
@@ -256,6 +259,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
     RUNS[run_id].update(
         status="running", started_at=datetime.utcnow(), results=[], count=0
     )
+
     try:
         log(
             run_id,
@@ -291,7 +295,6 @@ def run_scrape(run_id: str, params: ScrapeParams):
         scraped_count = 0
         page = 1
 
-        # Only used to avoid saving *exact same* listing URL multiple times
         saved_listing_urls: set[str] = set()
 
         MAX_RUNTIME_SECONDS = 900
@@ -304,7 +307,23 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 break
 
             log(run_id, f"Visiting search page {page}: {current_url}")
-            search_html = fetch_html(run_id, current_url)
+
+            # ---- fetch search page with 429-aware handling ----
+            try:
+                search_html = fetch_html(run_id, current_url)
+            except Exception as e:
+                msg = str(e) or ""
+                log(run_id, f"Failed to fetch search page {page}: {e}")
+                if "HTTP 429" in msg:
+                    log(
+                        run_id,
+                        f"Stopping pagination after page {page} due to repeated HTTP 429 rate limiting "
+                        f"from Kijiji. Returning partial results.",
+                    )
+                    break
+                else:
+                    # unexpected error: bail hard
+                    raise
 
             listing_links = get_listing_links_from_html(search_html)
             if not listing_links:
@@ -325,9 +344,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 processed_on_page += 1
 
+                # ---- fetch listing detail page, tolerant of 429 ----
                 try:
-                    detail_html = fetch_html(run_id, href)
-                    time.sleep(1.0)  # be polite
+                    detail_html = fetch_html(run_id, href, tries=3, base_delay=2.5)
+                    # be extra polite to avoid more 429s
+                    time.sleep(1.5 + random.uniform(0.2, 0.8))
                 except Exception as e:
                     log(run_id, f"Skipped {href} — failed to open ({e})")
                     continue
@@ -340,14 +361,13 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find("h1")
                 title_text = title_el.get_text(" ", strip=True) if title_el else ""
 
-                # First email pass from description
                 emails = re.findall(
                     r"[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+",
                     description or "",
                 )
                 email = emails[0] if emails else ""
 
-                # Realtor / management filter
+                # --- realtor / management filter ---
                 filter_text = " ".join(
                     t for t in [description, prospect_name, title_text] if t
                 )
@@ -383,7 +403,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — corporate profile logo present.")
                     continue
 
-                # PHONE
+                # --- phone ---
                 phone_number = find_phone_from_reveal(soup)
                 if not phone_number:
                     phone_number = find_phone_in_description(description)
@@ -414,9 +434,12 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
                 available_date = extract_available_date_from_details(soup)
 
-                # Dedup by listing URL at SAVE time (we still *visited* it)
+                # dedupe on SAVE, but still visited
                 if href in saved_listing_urls:
-                    log(run_id, f"Already saved lead for {href} earlier in this run; skipping duplicate save.")
+                    log(
+                        run_id,
+                        f"Already saved lead for {href} earlier in this run; skipping duplicate save.",
+                    )
                     continue
 
                 row = {
@@ -463,7 +486,8 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
             current_url = next_url
             page += 1
-            time.sleep(2.0)
+            # chill between pages
+            time.sleep(3.0 + random.uniform(0.5, 1.5))
 
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
@@ -532,19 +556,22 @@ def export_csv(run_id: str):
     run = RUNS.get(run_id)
     if not run:
         raise HTTPException(404, "run not found")
+
     import io
     if not run["results"]:
         return {"message": "no results"}
+
     fieldnames = list(RUNS[run_id]["results"][0].keys())
     buf = io.StringIO()
     writer = csv.DictWriter(buf, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
     writer.writeheader()
     for row in RUNS[run_id]["results"]:
         writer.writerow(row)
+
     from fastapi.responses import StreamingResponse
     buf.seek(0)
     return StreamingResponse(
         buf,
         media_type="text/csv",
-        headers={"Content-Disposition": f'attachment; filename=\"{run_id}.csv\"'},
+        headers={"Content-Disposition": f'attachment; filename="{run_id}.csv"'},
     )
