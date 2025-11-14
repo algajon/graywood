@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.5.2")
+app = FastAPI(title="Kijiji Scraper API", version="0.6.0")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -76,29 +76,52 @@ def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str
             time.sleep(delay * (i + 1))
     raise last_err if last_err else RuntimeError("fetch failed")
 
+def canonicalize_listing_url(href: str) -> str:
+    """
+    Take any Kijiji listing href (possibly relative and with ?imageNumber etc.)
+    and normalize it to a canonical absolute URL with ONLY scheme + netloc + path.
+    """
+    if not href:
+        return ""
+    if not href.startswith("http"):
+        href = "https://www.kijiji.ca" + href
+    parsed = urlparse(href)
+    # strip query + fragment so "/v-apt/123?imageNumber=5" -> "/v-apt/123"
+    clean = urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+    return clean
+
 def get_listing_links_from_html(html: str) -> List[str]:
+    """
+    Extract *canonical* listing URLs from a search page.
+
+    - Grabs anchors pointing at apartments / real-estate listings.
+    - Normalizes them via canonicalize_listing_url.
+    - Deduplicates while preserving order, so each listing appears once per page.
+    """
     soup = BeautifulSoup(html, 'html.parser')
-    hrefs = set()
+    raw_links: List[str] = []
 
     # Primary selector (current Kijiji markup)
     for a in soup.select('a[data-testid="listing-link"]'):
         href = a.get("href")
         if href:
-            hrefs.add(href)
+            raw_links.append(canonicalize_listing_url(href))
 
     # Fallback selectors
     for a in soup.select('a[href*="/v-apartments-condos/"], a[href*="/v-real-estate/"]'):
         href = a.get("href")
         if href:
-            hrefs.add(href)
+            raw_links.append(canonicalize_listing_url(href))
 
-    abs_hrefs = []
-    for href in hrefs:
-        if not href.startswith("http"):
-            href = "https://www.kijiji.ca" + href
-        abs_hrefs.append(href)
     # Deduplicate but preserve order
-    return list(dict.fromkeys(abs_hrefs))
+    seen = set()
+    abs_hrefs: List[str] = []
+    for href in raw_links:
+        if href and href not in seen:
+            seen.add(href)
+            abs_hrefs.append(href)
+
+    return abs_hrefs
 
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     """
@@ -285,7 +308,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
         )
 
         current_url = params.base_url
-        scraped_urls = set()
+        scraped_ids = set()  # canonical listing URLs we've already processed
         scraped_count = 0
         page = 1
 
@@ -307,20 +330,19 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 log(run_id, "No listing anchors found on this page. Stopping.")
                 break
 
-            # Only process links we haven't seen before on any page
-            new_links = [href for href in listing_links if href not in scraped_urls]
+            # Only process listings we haven't seen before on any page (canonical URLs)
+            new_links = [href for href in listing_links if href not in scraped_ids]
             log(
                 run_id,
-                f"Found {len(listing_links)} total listing-like links on page {page}, {len(new_links)} new.",
+                f"Found {len(listing_links)} canonical listing URLs on page {page}, {len(new_links)} new.",
             )
 
-            # NOTE: we NO LONGER stop when new_links == 0.
-            # We still go to the next page, so pagination is strictly page-by-page.
+            page_saved_before = scraped_count
 
             for href in new_links:
                 if scraped_count >= params.max_listings:
                     break
-                scraped_urls.add(href)
+                scraped_ids.add(href)
 
                 try:
                     detail_html = fetch_html(run_id, href)
@@ -394,7 +416,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 if not phone_number:
                     log(
                         run_id,
-                        f"Skipped {href} — no valid phone (tel: or +1 in description).",
+                        f"Skipped {href} — no valid phone (tel: or +1 / 10-digit number in description).",
                     )
                     continue
 
@@ -428,7 +450,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     "Available Date": available_date,
                     "City of Unit": city,
                     "Asking Price": asking_price,
-                    "Listing Profile URL": href,
+                    "Listing Profile URL": href,  # canonical URL (no ?imageNumber junk)
                     "Profile URL": profile_url,
                 }
                 for k, v in row.items():
@@ -438,6 +460,12 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 scraped_count += 1
                 RUNS[run_id]["count"] = scraped_count
                 log(run_id, f"Saved {scraped_count}/{params.max_listings}")
+
+            page_saved = scraped_count - page_saved_before
+            log(
+                run_id,
+                f"Page {page} summary: {len(new_links)} new canonical listings processed, {page_saved} leads saved on this page.",
+            )
 
             if scraped_count >= params.max_listings:
                 log(run_id, "Reached max_listings.")
