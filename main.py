@@ -1,10 +1,17 @@
-import re, csv, time, uuid, random
+import os
+import re
+import csv
+import time
+import uuid
+import random
+import io
 from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+import pymysql
 from fastapi import FastAPI, BackgroundTasks, HTTPException
-from fastapi.responses import RedirectResponse, JSONResponse
+from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
@@ -40,14 +47,157 @@ HEADERS = {
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
 }
 
+# ---------------- DB helpers ----------------
+def get_db_connection():
+    """
+    Returns a MySQL connection using env vars.
+
+    If connection fails (missing envs, DB down, etc.), returns None so the
+    scraper still works with in-memory storage only.
+    """
+    host = os.environ.get("DB_HOST")
+    user = os.environ.get("DB_USER")
+    password = os.environ.get("DB_PASSWORD")
+    name = os.environ.get("DB_NAME")
+
+    if not (host and user and password and name):
+        return None
+
+    try:
+        return pymysql.connect(
+            host=host,
+            user=user,
+            password=password,
+            database=name,
+            charset="utf8mb4",
+            autocommit=True,
+        )
+    except Exception:
+        return None
+
+
+def db_execute(query: str, params: tuple):
+    conn = get_db_connection()
+    if not conn:
+        return
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+    finally:
+        conn.close()
+
+
+def db_fetchone(query: str, params: tuple):
+    conn = get_db_connection()
+    if not conn:
+        return None
+    try:
+        with conn.cursor() as cur:
+            cur.execute(query, params)
+            return cur.fetchone()
+    finally:
+        conn.close()
+
+
+def update_run_status_in_db(
+    run_id: str,
+    status: Optional[str] = None,
+    count: Optional[int] = None,
+    set_started: bool = False,
+    set_finished: bool = False,
+):
+    """
+    UPDATE scrape_runs row for this run_id.
+    Does not INSERT (to avoid user_id NOT NULL issues) – assumes row already exists.
+    """
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    try:
+        parts = []
+        params: List[object] = []
+
+        if status is not None:
+            parts.append("status = %s")
+            params.append(status)
+        if count is not None:
+            parts.append("count = %s")
+            params.append(count)
+        if set_started:
+            parts.append("started_at = UTC_TIMESTAMP()")
+        if set_finished:
+            parts.append("finished_at = UTC_TIMESTAMP()")
+
+        if not parts:
+            return
+
+        parts.append("updated_at = UTC_TIMESTAMP()")
+        sql = "UPDATE scrape_runs SET " + ", ".join(parts) + " WHERE id = %s"
+        params.append(run_id)
+
+        with conn.cursor() as cur:
+            cur.execute(sql, tuple(params))
+    finally:
+        conn.close()
+
+
+def persist_run_csv_to_db(run_id: str):
+    """
+    Build CSV for this run from RUNS[run_id]['results'] and store it in
+    scrape_runs.csv_data (plus status/count/finished_at).
+    Safe no-op if DB is not configured or row doesn't exist.
+    """
+    run = RUNS.get(run_id)
+    if not run:
+        return
+
+    results = run.get("results") or []
+    status = run.get("status") or "succeeded"
+    count = run.get("count") or 0
+
+    conn = get_db_connection()
+    if not conn:
+        return
+
+    try:
+        csv_text = ""
+        if results:
+            fieldnames = list(results[0].keys())
+            buf = io.StringIO()
+            writer = csv.DictWriter(buf, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+            writer.writeheader()
+            for row in results:
+                writer.writerow(row)
+            csv_text = buf.getvalue()
+
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                UPDATE scrape_runs
+                   SET csv_data   = %s,
+                       status     = %s,
+                       count      = %s,
+                       finished_at = COALESCE(finished_at, UTC_TIMESTAMP()),
+                       updated_at  = UTC_TIMESTAMP()
+                 WHERE id = %s
+                """,
+                (csv_text, status, count, run_id),
+            )
+    finally:
+        conn.close()
+
+
 # ---------------- Models ----------------
 class ScrapeParams(BaseModel):
     base_url: str
     max_listings: int = Field(ge=1, le=5000, default=50)
 
+
 class StartResponse(BaseModel):
     run_id: str
     status: str
+
 
 class RunStatus(BaseModel):
     run_id: str
@@ -57,9 +207,11 @@ class RunStatus(BaseModel):
     finished_at: Optional[datetime] = None
     logs: List[str] = []
 
+
 # ---------------- Utilities ----------------
 def log(run_id: str, msg: str):
     RUNS[run_id]["logs"].append(msg)
+
 
 def fetch_html(run_id: str, url: str, tries: int = 4, base_delay: float = 2.0) -> str:
     """
@@ -75,7 +227,10 @@ def fetch_html(run_id: str, url: str, tries: int = 4, base_delay: float = 2.0) -
 
             if status == 429:
                 wait_for = base_delay * (i + 1) * 3  # e.g. 6, 12, 18, 24 sec
-                log(run_id, f"fetch_html HTTP 429 on {url} (attempt {i+1}/{tries}), backing off {wait_for:.1f}s")
+                log(
+                    run_id,
+                    f"fetch_html HTTP 429 on {url} (attempt {i+1}/{tries}), backing off {wait_for:.1f}s",
+                )
                 time.sleep(wait_for)
                 last_err = RuntimeError("HTTP 429")
                 continue
@@ -95,6 +250,7 @@ def fetch_html(run_id: str, url: str, tries: int = 4, base_delay: float = 2.0) -
     # after all tries
     raise last_err if last_err else RuntimeError("fetch failed")
 
+
 def canonicalize_listing_url(href: str) -> str:
     if not href:
         return ""
@@ -103,8 +259,9 @@ def canonicalize_listing_url(href: str) -> str:
     parsed = urlparse(href)
     return urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
 
+
 def get_listing_links_from_html(html: str) -> List[str]:
-    soup = BeautifulSoup(html, 'html.parser')
+    soup = BeautifulSoup(html, "html.parser")
     raw_links: List[str] = []
 
     for a in soup.select('a[data-testid="listing-link"]'):
@@ -126,6 +283,7 @@ def get_listing_links_from_html(html: str) -> List[str]:
             result.append(href)
     return result
 
+
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     """
     Determine the "next page" URL.
@@ -135,9 +293,9 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     2. Fallback: construct /page-N/ style before the last path segment (cXXlYY...)
        AND set ?page=N in the query string, e.g.:
 
-       /b-real-estate/oshawa-durham-region/page-2/c34l1700275?bb=...&page=2&view=list
+       /b-apartments-condos/oshawa-durham-region/page-2/c37l1700275...?&page=2&view=list
     """
-    soup = BeautifulSoup(page_html, 'html.parser')
+    soup = BeautifulSoup(page_html, "html.parser")
 
     # 1) <link rel="next"> if present
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
@@ -186,8 +344,7 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
 
     # split path and inject/replace page-N segment
     parts = path.strip("/").split("/")
-    # handle root edge-case
-    if parts == ['']:
+    if parts == [""]:
         parts = []
 
     if any(p.startswith("page-") for p in parts):
@@ -205,7 +362,7 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
 
     new_path = "/" + "/".join(new_parts)
 
-    # always also keep ?page=N in query so URL matches what you're seeing
+    # always also keep ?page=N in query
     q["page"] = [str(next_page)]
     new_qs = urlencode({k: v[0] if isinstance(v, list) else v for k, v in q.items()})
 
@@ -214,6 +371,7 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     )
 
     return next_url if next_url != current_url else None
+
 
 # ---------------- Phone helpers ----------------
 NANP_E164 = re.compile(r"^\+1([2-9]\d{2})([2-9]\d{2})(\d{4})$")
@@ -225,8 +383,10 @@ ANY_PHONE_TEXT = re.compile(
     r"(?<!\d)(?:\+?1[\s\-.]?)?\(?\s*([2-9]\d{2})\s*\)?[\s\-.]?([2-9]\d{2})[\s\-.]?(\d{4})(?!\d)"
 )
 
+
 def is_valid_nanp(e164: str) -> bool:
     return bool(NANP_E164.fullmatch(e164 or ""))
+
 
 def to_e164_from_digits(digits: str) -> str:
     digits = re.sub(r"\D+", "", digits or "")
@@ -238,6 +398,7 @@ def to_e164_from_digits(digits: str) -> str:
         return ""
     return candidate if is_valid_nanp(candidate) else ""
 
+
 def normalize_tel_href_or_text(raw: str) -> str:
     if not raw:
         return ""
@@ -245,8 +406,9 @@ def normalize_tel_href_or_text(raw: str) -> str:
         raw = raw[4:]
     return to_e164_from_digits(raw)
 
+
 def find_phone_from_reveal(soup: BeautifulSoup) -> str:
-    a = soup.find('a', href=ANY_TEL)
+    a = soup.find("a", href=ANY_TEL)
     if a:
         cand = normalize_tel_href_or_text(a.get("href", "")) or normalize_tel_href_or_text(
             a.get_text(strip=True)
@@ -259,6 +421,7 @@ def find_phone_from_reveal(soup: BeautifulSoup) -> str:
         return to_e164_from_digits("".join(m.groups()))
     return ""
 
+
 def find_phone_in_description(text: str) -> str:
     if not text:
         return ""
@@ -266,6 +429,7 @@ def find_phone_in_description(text: str) -> str:
     if not m:
         return ""
     return to_e164_from_digits("".join(m.groups()))
+
 
 def extract_description_text(soup: BeautifulSoup) -> str:
     desc = soup.find("div", {"data-testid": "vip-description-wrapper"})
@@ -276,8 +440,10 @@ def extract_description_text(soup: BeautifulSoup) -> str:
     txt = re.sub(r"\b(Social\s*(Lead)?\s*ID)\s*\d+\b", " ", txt, flags=re.I)
     return txt
 
+
 # ----------- Seller / meta helpers -----------
 PROFILE_HREF_RE = re.compile(r"^/(o-profile|o-kijiji-user|o-[a-z0-9\-]+)/", re.I)
+
 
 def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
     a = soup.select_one(
@@ -292,7 +458,9 @@ def extract_seller_info(soup: BeautifulSoup) -> tuple[str, str]:
     url = ("https://www.kijiji.ca" + a["href"]) if (a and a.get("href")) else ""
     return name, url
 
+
 AVAILABLE_P_RE = re.compile(r"^\s*Available\b", re.I)
+
 
 def extract_available_date_from_details(soup: BeautifulSoup) -> str:
     p = soup.find("p", string=AVAILABLE_P_RE)
@@ -300,13 +468,16 @@ def extract_available_date_from_details(soup: BeautifulSoup) -> str:
         return ""
     txt = p.get_text(strip=True)
     m = re.search(r"Available\s*(.*)$", txt, re.I)
-    return (m.group(1).strip() if m else txt)
+    return m.group(1).strip() if m else txt
+
 
 # ---------------- The scraper ----------------
 def run_scrape(run_id: str, params: ScrapeParams):
     RUNS[run_id].update(
         status="running", started_at=datetime.utcnow(), results=[], count=0
     )
+    # mark running in DB (if row exists)
+    update_run_status_in_db(run_id, status="running", count=0, set_started=True)
 
     try:
         log(
@@ -400,7 +571,9 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 description = extract_description_text(soup)
                 prospect_name, profile_url = extract_seller_info(soup)
 
-                title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find("h1")
+                title_el = soup.select_one("h1[data-testid='vip-title']") or soup.find(
+                    "h1"
+                )
                 title_text = title_el.get_text(" ", strip=True) if title_el else ""
 
                 emails = re.findall(
@@ -514,6 +687,9 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 f"{page_saved} leads saved on this page.",
             )
 
+            # sync count to DB occasionally
+            update_run_status_in_db(run_id, count=scraped_count)
+
             if scraped_count >= params.max_listings:
                 log(run_id, "Reached max_listings.")
                 break
@@ -534,10 +710,24 @@ def run_scrape(run_id: str, params: ScrapeParams):
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
 
+        # persist final status & CSV to DB
+        persist_run_csv_to_db(run_id)
+
     except Exception as e:
         RUNS[run_id]["status"] = "failed"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
         RUNS[run_id]["logs"].append(f"ERROR: {e}")
+        # mark failed in DB
+        try:
+            update_run_status_in_db(
+                run_id,
+                status="failed",
+                count=RUNS[run_id].get("count", 0),
+                set_finished=True,
+            )
+        except Exception:
+            pass
+
 
 # ---------------- FastAPI endpoints ----------------
 @app.post("/scrape", response_model=StartResponse)
@@ -552,34 +742,63 @@ def start_scrape(payload: ScrapeParams, bg: BackgroundTasks):
         "started_at": None,
         "finished_at": None,
     }
+
+    # if scrape_runs row already exists, keep DB in sync with queued status
+    try:
+        update_run_status_in_db(run_id, status="queued", count=0)
+    except Exception:
+        pass
+
     bg.add_task(run_scrape, run_id, payload)
     return StartResponse(run_id=run_id, status="queued")
+
 
 @app.get("/", include_in_schema=False)
 def root_redirect():
     return RedirectResponse(url="/docs")
 
+
 @app.get("/health", include_in_schema=False)
 def health():
     return JSONResponse({"status": "ok"})
+
 
 @app.post("/scrapes.start", response_model=StartResponse)
 def scrapes_start(payload: ScrapeParams, bg: BackgroundTasks):
     return start_scrape(payload, bg)
 
+
 @app.get("/runs/{run_id}", response_model=RunStatus)
 def get_status(run_id: str):
     run = RUNS.get(run_id)
-    if not run:
+    if run:
+        return RunStatus(
+            run_id=run_id,
+            status=run["status"],
+            count=run["count"],
+            started_at=run["started_at"],
+            finished_at=run["finished_at"],
+            logs=run["logs"][-200:],
+        )
+
+    # fallback to DB if process has been restarted
+    row = db_fetchone(
+        "SELECT status, count, started_at, finished_at FROM scrape_runs WHERE id = %s",
+        (run_id,),
+    )
+    if not row:
         raise HTTPException(404, "run not found")
+
+    status, count, started_at, finished_at = row
     return RunStatus(
         run_id=run_id,
-        status=run["status"],
-        count=run["count"],
-        started_at=run["started_at"],
-        finished_at=run["finished_at"],
-        logs=run["logs"][-200:],
+        status=status or "unknown",
+        count=count or 0,
+        started_at=started_at,
+        finished_at=finished_at,
+        logs=[],
     )
+
 
 @app.get("/runs/{run_id}/results")
 def get_results(run_id: str):
@@ -593,25 +812,33 @@ def get_results(run_id: str):
         "results": run["results"],
     }
 
+
 @app.get("/runs/{run_id}/export.csv")
 def export_csv(run_id: str):
     run = RUNS.get(run_id)
-    if not run:
-        raise HTTPException(404, "run not found")
 
-    import io
-    if not run["results"]:
-        return {"message": "no results"}
+    # 1) If this process still has results in memory, export them
+    if run and run["results"]:
+        fieldnames = list(run["results"][0].keys())
+        buf = io.StringIO()
+        writer = csv.DictWriter(buf, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
+        writer.writeheader()
+        for row in run["results"]:
+            writer.writerow(row)
+        buf.seek(0)
+        return StreamingResponse(
+            buf,
+            media_type="text/csv",
+            headers={"Content-Disposition": f'attachment; filename="{run_id}.csv"'},
+        )
 
-    fieldnames = list(RUNS[run_id]["results"][0].keys())
-    buf = io.StringIO()
-    writer = csv.DictWriter(buf, fieldnames=fieldnames, quoting=csv.QUOTE_ALL)
-    writer.writeheader()
-    for row in RUNS[run_id]["results"]:
-        writer.writerow(row)
+    # 2) Otherwise, fall back to csv_data stored in DB
+    row = db_fetchone("SELECT csv_data FROM scrape_runs WHERE id = %s", (run_id,))
+    if not row or not row[0]:
+        raise HTTPException(404, "no results")
 
-    from fastapi.responses import StreamingResponse
-    buf.seek(0)
+    csv_text = row[0]
+    buf = io.StringIO(csv_text)
     return StreamingResponse(
         buf,
         media_type="text/csv",
