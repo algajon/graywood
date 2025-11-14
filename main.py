@@ -345,15 +345,9 @@ def run_scrape(run_id: str, params: ScrapeParams):
 
         saved_listing_urls: set[str] = set()
 
-        MAX_RUNTIME_SECONDS = 900
         MAX_PAGES = 150
-        start_ts = time.time()
 
         while scraped_count < params.max_listings and page <= MAX_PAGES:
-            if time.time() - start_ts > MAX_RUNTIME_SECONDS:
-                log(run_id, "Reached max runtime, stopping.")
-                break
-
             log(run_id, f"Visiting search page {page}: {current_url}")
 
             # ---- fetch search page with 429-aware handling ----
