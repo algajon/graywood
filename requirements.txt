@@ -4,5 +4,6 @@ pydantic==1.10.12
 splinter==0.19.0
 selenium==4.11.2
 beautifulsoup4==4.12.2
+pymysql
 requests==2.31.0
 chromedriver-autoinstaller
