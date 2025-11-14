@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.5.1")
+app = FastAPI(title="Kijiji Scraper API", version="0.5.2")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -290,7 +290,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
         page = 1
 
         MAX_RUNTIME_SECONDS = 900  # 15 minutes safety cap
-        MAX_PAGES = 100            # avoid infinite pagination loops
+        MAX_PAGES = 150            # avoid infinite pagination loops
         start_ts = time.time()
 
         while scraped_count < params.max_listings and page <= MAX_PAGES:
@@ -314,9 +314,8 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 f"Found {len(listing_links)} total listing-like links on page {page}, {len(new_links)} new.",
             )
 
-            if not new_links:
-                log(run_id, "No new unique listing links on this page. Stopping pagination.")
-                break
+            # NOTE: we NO LONGER stop when new_links == 0.
+            # We still go to the next page, so pagination is strictly page-by-page.
 
             for href in new_links:
                 if scraped_count >= params.max_listings:
@@ -387,7 +386,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     log(run_id, f"Skipped {href} — corporate profile logo present.")
                     continue
 
-                # PHONE: tel: link or +1 in description / page text
+                # PHONE: tel: link or +1 / 10-digit number in description / page text
                 phone_number = find_phone_from_reveal(soup)
                 if not phone_number:
                     phone_number = find_phone_in_description(description)
