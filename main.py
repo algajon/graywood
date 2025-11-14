@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.5.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.5.1")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -289,21 +289,38 @@ def run_scrape(run_id: str, params: ScrapeParams):
         scraped_count = 0
         page = 1
 
-        while scraped_count < params.max_listings:
+        MAX_RUNTIME_SECONDS = 900  # 15 minutes safety cap
+        MAX_PAGES = 100            # avoid infinite pagination loops
+        start_ts = time.time()
+
+        while scraped_count < params.max_listings and page <= MAX_PAGES:
+            # Time guard
+            if time.time() - start_ts > MAX_RUNTIME_SECONDS:
+                log(run_id, "Reached max runtime, stopping.")
+                break
+
             log(run_id, f"Visiting search page {page}: {current_url}")
             search_html = fetch_html(run_id, current_url)
 
             listing_links = get_listing_links_from_html(search_html)
-            log(run_id, f"Found {len(listing_links)} potential listing links on page {page}")
             if not listing_links:
                 log(run_id, "No listing anchors found on this page. Stopping.")
                 break
 
-            for href in listing_links:
+            # Only process links we haven't seen before on any page
+            new_links = [href for href in listing_links if href not in scraped_urls]
+            log(
+                run_id,
+                f"Found {len(listing_links)} total listing-like links on page {page}, {len(new_links)} new.",
+            )
+
+            if not new_links:
+                log(run_id, "No new unique listing links on this page. Stopping pagination.")
+                break
+
+            for href in new_links:
                 if scraped_count >= params.max_listings:
                     break
-                if href in scraped_urls:
-                    continue
                 scraped_urls.add(href)
 
                 try:
