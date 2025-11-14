@@ -14,7 +14,7 @@ import requests
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
 
-app = FastAPI(title="Kijiji Scraper API", version="0.4.0")
+app = FastAPI(title="Kijiji Scraper API", version="0.5.0")
 
 # Allow requests from the main public site so agentbookr.com can call this service directly.
 app.add_middleware(
@@ -79,35 +79,69 @@ def fetch_html(run_id: str, url: str, tries: int = 3, delay: float = 1.0) -> str
 def get_listing_links_from_html(html: str) -> List[str]:
     soup = BeautifulSoup(html, 'html.parser')
     hrefs = set()
+
+    # Primary selector (current Kijiji markup)
     for a in soup.select('a[data-testid="listing-link"]'):
         href = a.get("href")
         if href:
             hrefs.add(href)
+
+    # Fallback selectors
     for a in soup.select('a[href*="/v-apartments-condos/"], a[href*="/v-real-estate/"]'):
         href = a.get("href")
         if href:
             hrefs.add(href)
+
     abs_hrefs = []
     for href in hrefs:
         if not href.startswith("http"):
             href = "https://www.kijiji.ca" + href
         abs_hrefs.append(href)
+    # Deduplicate but preserve order
     return list(dict.fromkeys(abs_hrefs))
 
 def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
+    """
+    Robust 'next page' detection for Kijiji search pages.
+    Tries several modern + legacy patterns before falling back to ?page=N.
+    """
     soup = BeautifulSoup(page_html, 'html.parser')
+
+    # 1) <link rel="next" ...>
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
         href = link["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+
+    # 2) <a aria-label="Next"> style buttons
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
         href = a["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+
+    # 3) Links whose visible text is "Next"
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
         href = a2["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+
+    # 4) Newer Kijiji pagination: data-testid
+    btn = soup.select_one('a[data-testid="pagination-next-link"]')
+    if btn and btn.get("href"):
+        href = btn["href"]
+        return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+
+    # 5) Numbered pagination: current li + next sibling
+    cur_page = soup.select_one('li.pagination-selected')
+    if cur_page:
+        next_li = cur_page.find_next_sibling("li")
+        if next_li:
+            link = next_li.find("a", href=True)
+            if link:
+                href = link["href"]
+                return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+
+    # 6) Fallback: increment ?page=N in the URL
     parsed = urlparse(current_url)
     q = parse_qs(parsed.query)
     cur = 1
@@ -258,9 +292,12 @@ def run_scrape(run_id: str, params: ScrapeParams):
         while scraped_count < params.max_listings:
             log(run_id, f"Visiting search page {page}: {current_url}")
             search_html = fetch_html(run_id, current_url)
+
             listing_links = get_listing_links_from_html(search_html)
+            log(run_id, f"Found {len(listing_links)} potential listing links on page {page}")
             if not listing_links:
-                log(run_id, "No listing anchors found on this page.")
+                log(run_id, "No listing anchors found on this page. Stopping.")
+                break
 
             for href in listing_links:
                 if scraped_count >= params.max_listings:
@@ -272,7 +309,7 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 try:
                     detail_html = fetch_html(run_id, href)
                     # be a tiny bit polite
-                    time.sleep(0.7)
+                    time.sleep(1.0)
                 except Exception as e:
                     log(run_id, f"Skipped {href} — failed to open ({e})")
                     continue
@@ -311,9 +348,21 @@ def run_scrape(run_id: str, params: ScrapeParams):
                     continue
 
                 # Skip corporate-style "apartments / rentals / residence" names/emails
-                blocked_brand_bits = ("apartments", "apartment", "rentals", "rental", "residence", "residences")
-                if any(b in name_l for b in blocked_brand_bits) or any(b in email_l for b in blocked_brand_bits):
-                    log(run_id, f"Skipped {href} — apartments/rentals/residence keyword in seller name/email.")
+                blocked_brand_bits = (
+                    "apartments",
+                    "apartment",
+                    "rentals",
+                    "rental",
+                    "residence",
+                    "residences",
+                )
+                if any(b in name_l for b in blocked_brand_bits) or any(
+                    b in email_l for b in blocked_brand_bits
+                ):
+                    log(
+                        run_id,
+                        f"Skipped {href} — apartments/rentals/residence keyword in seller name/email.",
+                    )
                     continue
 
                 # Corporate profile logo (e.g. Realstar logo block)
@@ -385,8 +434,11 @@ def run_scrape(run_id: str, params: ScrapeParams):
             if next_url == current_url:
                 log(run_id, "Next URL equals current URL (loop guard). Done.")
                 break
+
             current_url = next_url
             page += 1
+            # Be polite between pages to reduce throttling
+            time.sleep(2.0)
 
         RUNS[run_id]["status"] = "succeeded"
         RUNS[run_id]["finished_at"] = datetime.utcnow()
