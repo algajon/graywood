@@ -126,16 +126,56 @@ def get_listing_links_from_html(html: str) -> List[str]:
             result.append(href)
     return result
 
-def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
-    soup = BeautifulSoup(page_html, 'html.parser')
+def get_current_page_number(url: str) -> int:
+    """
+    Try to figure out what page we're currently on from:
+    - /page-N/ in the path
+    - ?page=N in the query
+    Default to 1 if nothing is present.
+    """
+    parsed = urlparse(url)
+    # /page-N/ in path
+    m = re.search(r"/page-(\d+)/", parsed.path)
+    if m:
+        try:
+            return int(m.group(1))
+        except ValueError:
+            pass
 
-    # link rel="next"
+    # ?page=N in query
+    q = parse_qs(parsed.query)
+    if "page" in q and q["page"]:
+        try:
+            return int(q["page"][0])
+        except ValueError:
+            pass
+
+    return 1
+
+def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
+    """
+    Discover the *real* next page URL from Kijiji's pagination.
+
+    Priority:
+      1. <link rel="next"> / explicit Next buttons (href from page)
+      2. Numeric page links for page N+1 (text/title/aria-label)
+      3. If path already has /page-N/ → bump to /page-(N+1)/
+      4. If /b-real-estate/.../c34... with no /page-*/ → insert /page-(N+1)/ before last segment + set ?page=N+1
+      5. Fallback: increment ?page=N in the query
+    """
+    soup = BeautifulSoup(page_html, 'html.parser')
+    parsed = urlparse(current_url)
+    current_page = get_current_page_number(current_url)
+    next_page_num = current_page + 1
+    next_label = str(next_page_num)
+
+    # 1) link rel="next"
     link = soup.find("link", rel=lambda v: v and "next" in v.lower())
     if link and link.get("href"):
         href = link["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # aria-label / text "Next"
+    # 2) "Next" buttons
     a = soup.find("a", attrs={"aria-label": re.compile(r"^\s*Next\s*$", re.I)})
     if a and a.get("href"):
         href = a["href"]
@@ -151,16 +191,69 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
         href = btn["href"]
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
-    # final fallback: increment ?page=N
-    parsed = urlparse(current_url)
+    # 3) numeric pagination links (for page N+1)
+    candidate_links: List[str] = []
+    for a3 in soup.find_all("a", href=True):
+        text = (a3.get_text(strip=True) or "")
+        title = (a3.get("title") or "").strip()
+        aria = (a3.get("aria-label") or "").strip()
+
+        if (
+            text == next_label
+            or title == f"Page {next_page_num}"
+            or aria == f"Page {next_page_num}"
+        ):
+            href = a3["href"]
+            url = href if href.startswith("http") else f"https://www.kijiji.ca{href}"
+            candidate_links.append(url)
+
+    if candidate_links:
+        # Take the first pagination link that clearly points to page N+1
+        next_url = candidate_links[0]
+        return next_url
+
+    # 4a) If current path already has /page-N/, bump it to /page-(N+1)/
+    path = parsed.path
+    if re.search(r"/page-(\d+)/", path):
+        new_path = re.sub(r"/page-(\d+)/", f"/page-{next_page_num}/", path, count=1)
+        q = parse_qs(parsed.query)
+        q["page"] = [str(next_page_num)]
+        new_qs = urlencode({k: v[0] if isinstance(v, list) else v for k, v in q.items()})
+        rebuilt = parsed._replace(path=new_path, query=new_qs)
+        next_url = urlunparse(rebuilt)
+        return next_url if next_url != current_url else None
+
+    # 4b) Real-estate style URL: /b-real-estate/.../c34l...  (no /page-*/ yet)
+    # Example desired:
+    #   /b-real-estate/oshawa-durham-region/page-2/c34l1700275?bb=...&page=2&view=list
+    if "/b-real-estate/" in path and "page-" not in path:
+        parts = path.split("/")
+        # ['', 'b-real-estate', 'oshawa-durham-region', 'c34l1700275']
+        if len(parts) >= 4:
+            # insert page-N before the last segment
+            new_parts = parts[:-1] + [f"page-{next_page_num}", parts[-1]]
+            new_path = "/".join(new_parts)
+            if not new_path.startswith("/"):
+                new_path = "/" + new_path
+        else:
+            # if structure is weird, fall back to just appending
+            new_path = path.rstrip("/") + f"/page-{next_page_num}/"
+
+        q = parse_qs(parsed.query)
+        q["page"] = [str(next_page_num)]
+        new_qs = urlencode({k: v[0] if isinstance(v, list) else v for k, v in q.items()})
+        rebuilt = parsed._replace(path=new_path, query=new_qs)
+        next_url = urlunparse(rebuilt)
+        return next_url if next_url != current_url else None
+
+    # 5) Final fallback: increment ?page=N only (keeps same path)
     q = parse_qs(parsed.query)
-    cur = 1
-    if "page" in q and q["page"]:
-        try:
-            cur = int(q["page"][0])
-        except Exception:
-            cur = 1
-    q["page"] = [str(cur + 1)]
+    cur = q.get("page", [str(current_page)])[0]
+    try:
+        cur_int = int(cur)
+    except Exception:
+        cur_int = current_page
+    q["page"] = [str(cur_int + 1)]
     new_qs = urlencode({k: v[0] if isinstance(v, list) else v for k, v in q.items()})
     next_url = urlunparse(
         (parsed.scheme, parsed.netloc, parsed.path, parsed.params, new_qs, parsed.fragment)
