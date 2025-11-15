@@ -9,6 +9,7 @@ from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
 
+from dotenv import load_dotenv
 import pymysql
 from fastapi import FastAPI, BackgroundTasks, HTTPException
 from fastapi.responses import RedirectResponse, JSONResponse, StreamingResponse
@@ -17,6 +18,9 @@ from pydantic import BaseModel, Field
 
 from bs4 import BeautifulSoup
 import requests
+
+# Load environment variables from .env (for local dev)
+load_dotenv()
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
@@ -52,13 +56,25 @@ def get_db_connection():
     """
     Returns a MySQL connection using env vars.
 
+    Designed to work with Laravel-style .env:
+
+      DB_CONNECTION=mysql
+      DB_HOST=...
+      DB_PORT=3306
+      DB_DATABASE=...
+      DB_USERNAME=...
+      DB_PASSWORD=...
+
     If connection fails (missing envs, DB down, etc.), returns None so the
     scraper still works with in-memory storage only.
     """
-    host = os.environ.get("DB_HOST")
-    user = os.environ.get("DB_USER")
-    password = os.environ.get("DB_PASSWORD")
-    name = os.environ.get("DB_NAME")
+    host = os.getenv("DB_HOST", "localhost")
+    port = int(os.getenv("DB_PORT", "3306"))
+
+    # Prefer Laravel names, but allow fallbacks
+    user = os.getenv("DB_USERNAME") or os.getenv("DB_USER")
+    password = os.getenv("DB_PASSWORD")
+    name = os.getenv("DB_DATABASE") or os.getenv("DB_NAME")
 
     if not (host and user and password and name):
         return None
@@ -66,6 +82,7 @@ def get_db_connection():
     try:
         return pymysql.connect(
             host=host,
+            port=port,
             user=user,
             password=password,
             database=name,
