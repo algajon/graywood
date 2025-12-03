@@ -507,6 +507,38 @@ def extract_description_text(soup: BeautifulSoup) -> str:
     return txt
 
 
+# ---------------- Price helpers ----------------
+# Minimum allowed price in numeric form (default 1400).
+# You can override via env: MIN_RENT_PRICE=1600, etc.
+MIN_PRICE = int(os.getenv("MIN_RENT_PRICE", "1400"))
+
+PRICE_RE = re.compile(r"(\d[\d,]*)")
+
+
+def extract_price_int(price_str: str) -> Optional[int]:
+    """
+    Extracts a numeric price (int) from a price string like:
+      "$1,450", "1,450.00", "CAD 1,450", etc.
+
+    Returns:
+      int price, or None if no numeric part is found.
+    """
+    if not price_str:
+        return None
+
+    # Normalize non-breaking spaces, etc.
+    cleaned = price_str.replace("\u00a0", " ")
+    m = PRICE_RE.search(cleaned)
+    if not m:
+        return None
+
+    digits = m.group(1).replace(",", "")
+    try:
+        return int(digits)
+    except ValueError:
+        return None
+
+
 # ----------- Seller / meta helpers -----------
 PROFILE_HREF_RE = re.compile(r"^/(o-profile|o-kijiji-user|o-[a-z0-9\-]+)/", re.I)
 
@@ -700,6 +732,15 @@ def run_scrape(run_id: str, params: ScrapeParams):
                 ptag = soup.select_one("p[data-testid='vip-price']")
                 if ptag:
                     asking_price = ptag.get_text(strip=True)
+
+                # ---- price filter: skip listings below MIN_PRICE ----
+                price_int = extract_price_int(asking_price)
+                if price_int is None or price_int < MIN_PRICE:
+                    log(
+                        run_id,
+                        f"Skipped {href} — asking price {asking_price!r} parsed as {price_int} below minimum {MIN_PRICE}.",
+                    )
+                    continue
 
                 unit_address = ""
                 city = ""
