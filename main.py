@@ -8,7 +8,7 @@ import io
 from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
-from pathlib import Path  # <-- NEW
+from pathlib import Path
 
 from dotenv import load_dotenv
 import pymysql
@@ -77,10 +77,10 @@ def get_db_connection():
     """
     Returns a MySQL connection using env vars.
 
-    Designed to work with Laravel-style .env:
+    Expected .env / env variables:
 
-      DB_CONNECTION=mysql
-      DB_HOST=...
+      DB_CONNECTION=mysql      (optional, unused here)
+      DB_HOST=...              (Hostinger IP or hostname, e.g. 72.60.86.13)
       DB_PORT=3306
       DB_DATABASE=...
       DB_USERNAME=...
@@ -94,20 +94,35 @@ def get_db_connection():
     If connection fails (missing envs, DB down, etc.), returns None so the
     scraper still works with in-memory storage only.
     """
-    host = os.getenv("DB_HOST", "localhost")
-    port = int(os.getenv("DB_PORT", "3306"))
+    host = os.getenv("DB_HOST")  # no default; must be set explicitly
+    port_str = os.getenv("DB_PORT", "3306")
 
     # Prefer Laravel names, but allow fallbacks
     user = os.getenv("DB_USERNAME") or os.getenv("DB_USER")
     password = os.getenv("DB_PASSWORD")
     name = os.getenv("DB_DATABASE") or os.getenv("DB_NAME")
 
-    # Basic sanity check on required pieces
-    if not (user and password and name):
+    missing = []
+    if not host:
+        missing.append("DB_HOST")
+    if not user:
+        missing.append("DB_USERNAME (or DB_USER)")
+    if not password:
+        missing.append("DB_PASSWORD")
+    if not name:
+        missing.append("DB_DATABASE (or DB_NAME)")
+
+    if missing:
         print(
-            "DB connection not configured. "
-            "Expected DB_USERNAME, DB_PASSWORD, DB_DATABASE (or DB_NAME)."
+            "DB connection not configured. Missing required environment variables:",
+            ", ".join(missing),
         )
+        return None
+
+    try:
+        port = int(port_str)
+    except ValueError:
+        print(f"Invalid DB_PORT value: {port_str!r}")
         return None
 
     try:
