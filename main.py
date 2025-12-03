@@ -8,6 +8,7 @@ import io
 from datetime import datetime
 from typing import Dict, List, Optional
 from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from pathlib import Path  # <-- NEW
 
 from dotenv import load_dotenv
 import pymysql
@@ -19,8 +20,28 @@ from pydantic import BaseModel, Field
 from bs4 import BeautifulSoup
 import requests
 
-# Load environment variables from .env (for local dev)
-load_dotenv()
+# -------------------------------------------------
+# Load environment variables from .env
+#
+# This works in two scenarios:
+#   1) Local development:
+#        - .env file at project root
+#   2) Render.com with Secret File:
+#        - Secret file named ".env" is available at:
+#            - /etc/secrets/.env
+#            - and in the project root
+#
+# We try both locations and DO NOT override existing
+# env vars (e.g. ones set directly in Render UI).
+# -------------------------------------------------
+dotenv_candidates = [
+    Path(".env"),
+    Path("/etc/secrets/.env"),
+]
+
+for dotenv_path in dotenv_candidates:
+    if dotenv_path.is_file():
+        load_dotenv(dotenv_path=dotenv_path, override=False)
 
 # ---------------- In-memory state ----------------
 RUNS: Dict[str, dict] = {}
@@ -65,6 +86,11 @@ def get_db_connection():
       DB_USERNAME=...
       DB_PASSWORD=...
 
+    Values can come from:
+      - Local .env (when developing)
+      - Render secret file ".env" (loaded above)
+      - Environment Variables set directly in Render
+
     If connection fails (missing envs, DB down, etc.), returns None so the
     scraper still works with in-memory storage only.
     """
@@ -76,11 +102,16 @@ def get_db_connection():
     password = os.getenv("DB_PASSWORD")
     name = os.getenv("DB_DATABASE") or os.getenv("DB_NAME")
 
-    if not (host and user and password and name):
+    # Basic sanity check on required pieces
+    if not (user and password and name):
+        print(
+            "DB connection not configured. "
+            "Expected DB_USERNAME, DB_PASSWORD, DB_DATABASE (or DB_NAME)."
+        )
         return None
 
     try:
-        return pymysql.connect(
+        conn = pymysql.connect(
             host=host,
             port=port,
             user=user,
@@ -89,7 +120,10 @@ def get_db_connection():
             charset="utf8mb4",
             autocommit=True,
         )
-    except Exception:
+        return conn
+    except Exception as e:
+        # This goes to Render logs; helpful for debugging
+        print(f"Error connecting to DB at {host}:{port} / {name}: {e}")
         return None
 
 
@@ -329,13 +363,13 @@ def find_next_page_url(current_url: str, page_html: str) -> Optional[str]:
     # 3) <a>Next</a> text
     a2 = soup.find("a", string=re.compile(r"^\s*Next\s*$", re.I))
     if a2 and a2.get("href"):
-        href = a2["href"]
+        href = a2.get("href")
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
     # 4) data-testid pagination button
     btn = soup.select_one('a[data-testid="pagination-next-link"]')
     if btn and btn.get("href"):
-        href = btn["href"]
+        href = btn.get("href")
         return href if href.startswith("http") else f"https://www.kijiji.ca{href}"
 
     # 5) Fallback: manually build /page-N/ + ?page=N
